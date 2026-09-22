@@ -37,7 +37,19 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework_simplejwt',
     'corsheaders',
+    # OwnManage Domain Apps
+    'apps.core',
+    'apps.accounts',
+    'apps.organization',
+    'apps.attendance',
+    'apps.leaves',
+    'apps.payroll',
+    'apps.subscriptions',
 ]
+
+# Custom User Model
+AUTH_USER_MODEL = 'accounts.User'
+
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -82,6 +94,15 @@ DATABASES = {
         'PORT': os.getenv('DB_PORT', '5432'),
     }
 }
+
+# Automated unit tests run on in-memory SQLite to avoid mutating remote cloud DB or requiring CREATE DATABASE rights
+import sys
+if 'test' in sys.argv:
+    DATABASES['default'] = {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': ':memory:',
+    }
+
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
@@ -146,3 +167,12 @@ CORS_ALLOWED_ORIGINS = [
     origin.strip() for origin in cors_origins_raw.split(',') if origin.strip()
 ]
 CORS_ALLOW_CREDENTIALS = True
+
+# Email configuration for transactional OTP & system notifications
+EMAIL_BACKEND = os.getenv('DJANGO_EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'noreply@ownmanage.in')
+EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.sendgrid.net')
+EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
+EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True').lower() in ('true', '1')
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
