@@ -29,6 +29,7 @@ from apps.subscriptions.views import (
     CapacityReallocateView, BrokerListCreateView, BrokerDashboardView,
     CommissionListView
 )
+from apps.subscriptions.analytics_views import SuperAdminAnalyticsView
 from apps.core.views import (
     NotificationListView, NotificationMarkReadView
 )
@@ -66,6 +67,9 @@ urlpatterns = [
     path('brokers/', BrokerListCreateView.as_view(), name='api-brokers'),
     path('brokers/dashboard/', BrokerDashboardView.as_view(), name='api-broker-dashboard'),
     path('commissions/', CommissionListView.as_view(), name='api-commissions'),
+
+    # SuperAdmin SaaS Analytics
+    path('analytics/superadmin/', SuperAdminAnalyticsView.as_view(), name='api-superadmin-analytics'),
 
     # Managers
     path('managers/', ManagerListView.as_view(), name='api-managers'),

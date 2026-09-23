@@ -6,10 +6,22 @@ from apps.core.models import TimeStampedUUIDModel
 
 
 class SubscriptionStatus(models.TextChoices):
-    ACTIVE = 'ACTIVE', _('Active')
     TRIAL = 'TRIAL', _('Trial')
+    ACTIVE_PAID = 'ACTIVE_PAID', _('Active Paid')
+    ACTIVE = 'ACTIVE', _('Active')
+    PAYMENT_DUE = 'PAYMENT_DUE', _('Payment Due')
+    OVERDUE = 'OVERDUE', _('Overdue')
     EXPIRED = 'EXPIRED', _('Expired')
     CANCELLED = 'CANCELLED', _('Cancelled')
+    SUSPENDED = 'SUSPENDED', _('Suspended')
+
+
+class PaymentStatus(models.TextChoices):
+    PAID = 'PAID', _('Paid')
+    PENDING = 'PENDING', _('Payment Due / Pending')
+    OVERDUE = 'OVERDUE', _('Overdue')
+    FAILED = 'FAILED', _('Failed')
+    REFUNDED = 'REFUNDED', _('Refunded')
 
 
 class SubscriptionAction(models.TextChoices):
@@ -303,3 +315,57 @@ class Commission(TimeStampedUUIDModel):
 
     def __str__(self):
         return f"{self.broker.name} - {self.business.name}: {self.commission_amount} ({self.status})"
+
+
+class SubscriptionPayment(TimeStampedUUIDModel):
+    """
+    Authoritative record of a subscription billing payment or invoice.
+    Tracks paid vs pending revenue, collection dates, and transaction references.
+    """
+    subscription = models.ForeignKey(
+        Subscription,
+        on_delete=models.CASCADE,
+        related_name='payments',
+        verbose_name=_('Subscription')
+    )
+    business = models.ForeignKey(
+        'organization.Business',
+        on_delete=models.CASCADE,
+        related_name='subscription_payments',
+        verbose_name=_('Enterprise')
+    )
+    plan = models.ForeignKey(
+        Plan,
+        on_delete=models.PROTECT,
+        related_name='payments',
+        verbose_name=_('Plan Billed')
+    )
+    amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        verbose_name=_('Amount')
+    )
+    billing_date = models.DateField(verbose_name=_('Billing Date'))
+    due_date = models.DateField(verbose_name=_('Due Date'))
+    status = models.CharField(
+        max_length=30,
+        choices=PaymentStatus.choices,
+        default=PaymentStatus.PAID,
+        verbose_name=_('Payment Status')
+    )
+    paid_at = models.DateTimeField(null=True, blank=True, verbose_name=_('Paid At'))
+    payment_reference = models.CharField(max_length=100, blank=True, verbose_name=_('Payment / Transaction Reference'))
+    invoice_number = models.CharField(max_length=50, blank=True, verbose_name=_('Invoice Number'))
+    notes = models.TextField(blank=True, verbose_name=_('Notes'))
+
+    class Meta:
+        verbose_name = _('Subscription Payment')
+        verbose_name_plural = _('Subscription Payments')
+        ordering = ['-billing_date']
+        indexes = [
+            models.Index(fields=['business', 'status'], name='idx_sub_pmt_biz_status'),
+            models.Index(fields=['billing_date', 'status'], name='idx_sub_pmt_date_status'),
+        ]
+
+    def __str__(self):
+        return f"{self.business.name} - {self.plan.name}: ₹{self.amount} ({self.status})"

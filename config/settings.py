@@ -166,6 +166,16 @@ cors_origins_raw = os.getenv('CORS_ALLOWED_ORIGINS', '')
 CORS_ALLOWED_ORIGINS = [
     origin.strip() for origin in cors_origins_raw.split(',') if origin.strip()
 ]
+if DEBUG:
+    # Ensure development web app and mobile web ports are always permitted
+    for dev_origin in [
+        'http://localhost:5173', 'http://127.0.0.1:5173',
+        'http://localhost:8081', 'http://127.0.0.1:8081',
+        'http://localhost:19006', 'http://127.0.0.1:19006',
+        'http://localhost:3000', 'http://127.0.0.1:3000',
+    ]:
+        if dev_origin not in CORS_ALLOWED_ORIGINS:
+            CORS_ALLOWED_ORIGINS.append(dev_origin)
 CORS_ALLOW_CREDENTIALS = True
 
 # Email configuration for transactional OTP & system notifications
