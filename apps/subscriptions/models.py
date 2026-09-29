@@ -185,6 +185,13 @@ class Subscription(TimeStampedUUIDModel):
     def unallocated_capacity(self) -> int:
         return max(0, self.plan.total_employee_capacity - self.total_allocated_capacity)
 
+    @property
+    def days_remaining(self) -> int:
+        from datetime import date
+        if not self.current_period_end:
+            return 0
+        return (self.current_period_end - date.today()).days
+
 
 class SubscriptionHistory(TimeStampedUUIDModel):
     """

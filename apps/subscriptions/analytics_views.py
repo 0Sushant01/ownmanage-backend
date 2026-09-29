@@ -74,9 +74,12 @@ class SuperAdminAnalyticsView(APIView):
         biz_growth_pct = self._calculate_growth(new_biz, prev_new_biz)
 
         active_biz = businesses_qs.filter(is_active=True).count()
+        inactive_biz = max(0, total_biz - active_biz)
         active_pct = round((active_biz / total_biz * 100) if total_biz > 0 else 0.0, 1)
 
         total_emp = Employee.objects.filter(business__in=businesses_qs).count()
+        active_emp = Employee.objects.filter(business__in=businesses_qs, employment_status=EmploymentStatus.ACTIVE).count()
+        inactive_emp = max(0, total_emp - active_emp)
         prev_emp = Employee.objects.filter(
             business__in=businesses_qs,
             created_at__date__lte=prev_end
@@ -100,41 +103,46 @@ class SuperAdminAnalyticsView(APIView):
 
         revenue_growth_pct = self._calculate_growth(current_paid_revenue, prev_paid_revenue)
 
-        # Subscriptions payment status
-        paid_subs = Subscription.objects.filter(
+        # Subscriptions KPI calculations
+        active_subs = Subscription.objects.filter(
             business__in=businesses_qs,
             status__in=[SubscriptionStatus.ACTIVE, SubscriptionStatus.ACTIVE_PAID]
         ).count()
-        paid_subs_pct = round((paid_subs / total_biz * 100) if total_biz > 0 else 0.0, 1)
+        expiring_soon_subs = Subscription.objects.filter(
+            business__in=businesses_qs,
+            current_period_end__gte=today,
+            current_period_end__lte=today + timedelta(days=7)
+        ).count()
+        expired_subs = Subscription.objects.filter(
+            business__in=businesses_qs,
+            current_period_end__lt=today
+        ).count()
 
         pending_payments = payments_qs.filter(
             status__in=[PaymentStatus.PENDING, PaymentStatus.OVERDUE],
             billing_date__gte=start_date,
             billing_date__lte=end_date
         )
-        payment_due_count = pending_payments.count()
         payment_due_amount = pending_payments.aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
+        payment_due_biz_count = pending_payments.values('business').distinct().count()
 
-        # 5. Monthly Business Growth Chart Data (Last 6 Months Time Series)
+        # Broker commission payable KPI
+        comm_pending_qs = Commission.objects.filter(status=CommissionStatus.PENDING)
+        comm_pending_amount = comm_pending_qs.aggregate(sum=Sum('commission_amount'))['sum'] or Decimal('0.00')
+        comm_pending_brokers_count = comm_pending_qs.values('broker').distinct().count()
+
+        # 5. Charts
         growth_chart = self._generate_growth_chart(businesses_qs, today)
-
-        # 6. Monthly Subscription Revenue Trend Chart Data (Last 6 Months Time Series)
         revenue_chart = self._generate_revenue_chart(businesses_qs, today)
+        subscription_growth_chart = self._generate_subscription_growth_chart(businesses_qs, today)
 
-        # 7. Subscription Status Breakdown
+        # 6. Status Breakdown & Plan Distribution
         status_breakdown = self._generate_status_breakdown(businesses_qs)
-
-        # 8. Plan Distribution Table
         plan_distribution = self._generate_plan_distribution(businesses_qs)
-
-        # 9. Broker Performance Summary
         broker_performance = self._generate_broker_performance()
-
-        # 10. Action Required Alerts
         action_required = self._generate_action_required(today)
-
-        # 11. Recent Platform Activity
         recent_activity = self._generate_recent_activity(businesses_qs)
+        expiring_subscriptions = self._generate_expiring_subscriptions(businesses_qs, today)
 
         payload = {
             'period': {
@@ -144,29 +152,47 @@ class SuperAdminAnalyticsView(APIView):
             },
             'kpis': {
                 'total_businesses': total_biz,
+                'active_businesses': active_biz,
+                'inactive_businesses': inactive_biz,
                 'new_businesses': new_biz,
                 'business_growth_pct': biz_growth_pct,
-                'active_businesses': active_biz,
                 'active_pct': active_pct,
+
+                'active_subscriptions': active_subs,
+                'paid_subscriptions': active_subs,
+                'paid_pct': round((active_subs / total_biz * 100) if total_biz > 0 else 0.0, 1),
+                'expiring_soon_subscriptions': expiring_soon_subs,
+                'expired_subscriptions': expired_subs,
+
                 'total_employees': total_emp,
+                'active_employees': active_emp,
+                'inactive_employees': inactive_emp,
                 'employee_growth_pct': emp_growth_pct,
+
                 'subscription_revenue': float(current_paid_revenue),
+                'prev_month_revenue': float(prev_paid_revenue),
                 'revenue_growth_pct': revenue_growth_pct,
-                'paid_subscriptions': paid_subs,
-                'paid_pct': paid_subs_pct,
-                'payment_due_count': payment_due_count,
+
+                'payment_due_count': payment_due_biz_count,
                 'payment_due_amount': float(payment_due_amount),
+                'payment_due_businesses_count': payment_due_biz_count,
+
+                'broker_commission_payable': float(comm_pending_amount),
+                'broker_commission_payable_count': comm_pending_brokers_count,
             },
             'growth_chart': growth_chart,
             'revenue_chart': revenue_chart,
+            'subscription_growth_chart': subscription_growth_chart,
             'status_breakdown': status_breakdown,
             'plan_distribution': plan_distribution,
             'broker_performance': broker_performance,
             'action_required': action_required,
             'recent_activity': recent_activity,
+            'expiring_subscriptions': expiring_subscriptions,
         }
 
         return Response(payload, status=status.HTTP_200_OK)
+
 
     def _get_date_range(self, period: str, request, today: date):
         """Calculates start and end dates based on the selected period."""
@@ -283,6 +309,103 @@ class SuperAdminAnalyticsView(APIView):
                 'pending_amount': float(pending),
             })
         return points
+
+    def _generate_subscription_growth_chart(self, businesses_qs, today: date):
+        """
+        Generates 6 monthly data points for Subscription Growth graph:
+        New subscriptions, Renewals, Upgrades, Downgrades, Expired, Cancelled.
+        """
+        points = []
+        for i in range(5, -1, -1):
+            year = today.year
+            month = today.month - i
+            while month <= 0:
+                month += 12
+                year -= 1
+
+            month_start = date(year, month, 1)
+            month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+            label = month_start.strftime('%b %y')
+
+            # Historical subscription actions within this month
+            hist_qs = SubscriptionHistory.objects.filter(
+                business__in=businesses_qs,
+                effective_from__gte=month_start,
+                effective_from__lte=month_end
+            )
+
+            new_subs = hist_qs.filter(action='INITIAL').count()
+            upgrades = hist_qs.filter(action='UPGRADE').count()
+            downgrades = hist_qs.filter(action='DOWNGRADE').count()
+            renewals = hist_qs.filter(action='RENEWAL').count()
+            cancelled = hist_qs.filter(action='CANCEL').count()
+
+            # If no history yet in this period, count current subscriptions started in that month
+            if new_subs == 0:
+                new_subs = Subscription.objects.filter(
+                    business__in=businesses_qs,
+                    start_date__gte=month_start,
+                    start_date__lte=month_end
+                ).count()
+
+            expired = Subscription.objects.filter(
+                business__in=businesses_qs,
+                current_period_end__gte=month_start,
+                current_period_end__lte=month_end,
+                current_period_end__lt=today
+            ).count()
+
+            points.append({
+                'month': label,
+                'new': new_subs,
+                'renewals': renewals,
+                'upgrades': upgrades,
+                'downgrades': downgrades,
+                'expired': expired,
+                'cancelled': cancelled,
+                'total_activity': new_subs + renewals + upgrades + downgrades
+            })
+        return points
+
+    def _generate_expiring_subscriptions(self, businesses_qs, today: date):
+        """
+        Builds the Expiring Subscriptions table data.
+        Highlights: 0-3 days critical, 4-7 days warning, 8-30 days upcoming.
+        """
+        subs = Subscription.objects.filter(
+            business__in=businesses_qs,
+            current_period_end__isnull=False
+        ).select_related('business', 'plan').prefetch_related('business__referral__broker').order_by('current_period_end')
+
+        results = []
+        for s in subs:
+            days = (s.current_period_end - today).days
+            if days <= 30:
+                if days <= 3:
+                    urgency = 'critical'
+                elif days <= 7:
+                    urgency = 'warning'
+                else:
+                    urgency = 'upcoming'
+
+                ref = getattr(s.business, 'referral', None)
+                last_pmt = s.payments.order_by('-billing_date').first()
+                payment_status = last_pmt.status if last_pmt else ('PAID' if s.status in ['ACTIVE', 'ACTIVE_PAID'] else 'PENDING')
+
+                results.append({
+                    'id': str(s.id),
+                    'business_id': str(s.business.id),
+                    'business_name': s.business.name,
+                    'current_plan': s.plan.name,
+                    'monthly_charge': float(s.plan.monthly_charge),
+                    'expiry_date': str(s.current_period_end),
+                    'days_remaining': days,
+                    'urgency': urgency,
+                    'payment_status': payment_status,
+                    'assigned_broker': ref.broker.name if (ref and ref.broker) else 'Direct / Organic',
+                })
+        return results
+
 
     def _generate_status_breakdown(self, businesses_qs):
         """Categorizes subscriptions by status and computes revenue totals."""

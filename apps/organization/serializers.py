@@ -9,6 +9,20 @@ from apps.organization.services import generate_next_employee_id
 
 
 class BusinessSerializer(serializers.ModelSerializer):
+    current_plan_name = serializers.SerializerMethodField()
+    current_plan_id = serializers.SerializerMethodField()
+    subscription_status = serializers.SerializerMethodField()
+    payment_status = serializers.SerializerMethodField()
+    start_date = serializers.SerializerMethodField()
+    expiry_date = serializers.SerializerMethodField()
+    days_remaining = serializers.SerializerMethodField()
+    total_centres = serializers.SerializerMethodField()
+    employee_capacity = serializers.SerializerMethodField()
+    active_employees_count = serializers.SerializerMethodField()
+    managers_count = serializers.SerializerMethodField()
+    broker_name = serializers.SerializerMethodField()
+    broker_code = serializers.SerializerMethodField()
+
     class Meta:
         model = Business
         fields = [
@@ -16,9 +30,82 @@ class BusinessSerializer(serializers.ModelSerializer):
             'address_line_1', 'address_line_2', 'city', 'state', 'postal_code', 'country',
             'timezone', 'currency',
             'employee_id_enabled', 'employee_id_prefix', 'employee_id_next_number',
-            'is_active', 'created_at', 'updated_at'
+            'is_active', 'created_at', 'updated_at',
+            'current_plan_name', 'current_plan_id', 'subscription_status', 'payment_status',
+            'start_date', 'expiry_date', 'days_remaining',
+            'total_centres', 'employee_capacity', 'active_employees_count', 'managers_count',
+            'broker_name', 'broker_code'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = [
+            'id', 'created_at', 'updated_at',
+            'current_plan_name', 'current_plan_id', 'subscription_status', 'payment_status',
+            'start_date', 'expiry_date', 'days_remaining',
+            'total_centres', 'employee_capacity', 'active_employees_count', 'managers_count',
+            'broker_name', 'broker_code'
+        ]
+
+    def get_current_plan_name(self, obj) -> str:
+        if hasattr(obj, 'subscription') and obj.subscription and obj.subscription.plan:
+            return obj.subscription.plan.name
+        return 'No Plan Assigned'
+
+    def get_current_plan_id(self, obj) -> str | None:
+        if hasattr(obj, 'subscription') and obj.subscription and obj.subscription.plan:
+            return str(obj.subscription.plan.id)
+        return None
+
+    def get_subscription_status(self, obj) -> str:
+        if hasattr(obj, 'subscription') and obj.subscription:
+            return obj.subscription.status
+        return 'INACTIVE'
+
+    def get_payment_status(self, obj) -> str:
+        if hasattr(obj, 'subscription') and obj.subscription:
+            last_pmt = obj.subscription.payments.order_by('-billing_date').first()
+            if last_pmt:
+                return last_pmt.status
+            return 'PAID' if obj.subscription.status in ['ACTIVE', 'ACTIVE_PAID'] else 'PENDING'
+        return 'UNBILLED'
+
+    def get_start_date(self, obj) -> str | None:
+        if hasattr(obj, 'subscription') and obj.subscription:
+            return str(obj.subscription.start_date)
+        return None
+
+    def get_expiry_date(self, obj) -> str | None:
+        if hasattr(obj, 'subscription') and obj.subscription:
+            return str(obj.subscription.current_period_end)
+        return None
+
+    def get_days_remaining(self, obj) -> int:
+        if hasattr(obj, 'subscription') and obj.subscription:
+            return obj.subscription.days_remaining
+        return 0
+
+    def get_total_centres(self, obj) -> int:
+        return obj.branches.filter(is_active=True).count()
+
+    def get_employee_capacity(self, obj) -> int:
+        if hasattr(obj, 'subscription') and obj.subscription and obj.subscription.plan:
+            return obj.subscription.plan.total_employee_capacity
+        return 0
+
+    def get_active_employees_count(self, obj) -> int:
+        return obj.employees.filter(employment_status='ACTIVE').count()
+
+    def get_managers_count(self, obj) -> int:
+        return obj.memberships.filter(role=BusinessRole.MANAGER, is_active=True).count()
+
+    def get_broker_name(self, obj) -> str | None:
+        if hasattr(obj, 'referral') and obj.referral and obj.referral.broker:
+            return obj.referral.broker.name
+        return None
+
+    def get_broker_code(self, obj) -> str | None:
+        if hasattr(obj, 'referral') and obj.referral and obj.referral.broker:
+            return obj.referral.broker.referral_code
+        return None
+
 
 
 class BranchSerializer(serializers.ModelSerializer):

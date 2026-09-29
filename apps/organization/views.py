@@ -63,10 +63,47 @@ class BusinessDetailView(views.APIView):
         ctx = get_user_context(request)
         if not ctx['is_superadmin'] and ctx['role'] != BusinessRole.BUSINESS_ADMIN:
             raise PermissionDenied('Only Business Admin or SuperAdmin can update business details.')
+        old_active = biz.is_active
         serializer = BusinessSerializer(biz, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return Response(BusinessSerializer(biz).data)
+        updated_biz = serializer.save()
+
+        if 'is_active' in request.data and updated_biz.is_active != old_active:
+            from apps.core.audit import record_audit_log
+            action = 'BUSINESS_REACTIVATED' if updated_biz.is_active else 'BUSINESS_DEACTIVATED'
+            record_audit_log(
+                action=action,
+                entity_type='Business',
+                entity_id=str(updated_biz.id),
+                actor=request.user,
+                business=updated_biz,
+                old_data={'is_active': old_active},
+                new_data={'is_active': updated_biz.is_active},
+                request=request
+            )
+
+        return Response(BusinessSerializer(updated_biz).data)
+
+
+class BusinessCentresCapacityView(views.APIView):
+    """
+    Returns all centres belonging to a business with their capacity allocation
+    and active employee count for SuperAdmin/Business Admin capacity management.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        ctx = get_user_context(request)
+        if not ctx['is_superadmin'] and (not ctx['business'] or str(ctx['business'].id) != str(pk)):
+            raise PermissionDenied('Unauthorized access.')
+
+        biz = Business.objects.filter(id=pk).first()
+        if not biz:
+            raise NotFound('Business not found.')
+
+        branches = biz.branches.filter(is_active=True).order_by('name')
+        return Response(BranchSerializer(branches, many=True).data)
+
 
 
 class BusinessStatsView(views.APIView):

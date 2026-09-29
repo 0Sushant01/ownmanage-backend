@@ -3,13 +3,15 @@ from rest_framework_simplejwt.views import TokenRefreshView
 
 from apps.accounts.views import (
     LoginView, LogoutView, CurrentUserView, ProfileView,
-    ForgotPasswordView, VerifyOTPView, ResetPasswordView, ActivateAccountView
+    ForgotPasswordView, VerifyOTPView, ResetPasswordView, ActivateAccountView,
+    ChangePasswordView, EmailUpdateView
 )
 from apps.organization.views import (
     BusinessListCreateView, BusinessDetailView, BusinessStatsView, BusinessCreateAdminView,
     ManagerListView, ManagerDetailView,
     EmployeeListView, EmployeeDetailView, EmployeeDeactivateView, EmployeeMetadataView,
-    CentreListCreateView, CentreDetailView, DepartmentListCreateView
+    CentreListCreateView, CentreDetailView, DepartmentListCreateView,
+    BusinessCentresCapacityView
 )
 from apps.attendance.views import (
     AttendanceTodayView, AttendanceCheckInView, AttendanceCheckOutView,
@@ -27,11 +29,12 @@ from apps.payroll.views import (
 from apps.subscriptions.views import (
     PlanListCreateView, PlanDetailView, SubscriptionDetailView,
     CapacityReallocateView, BrokerListCreateView, BrokerDashboardView,
-    CommissionListView
+    CommissionListView, PlanSubscribersView, BrokerDetailView,
+    PayCommissionView, BusinessSubscriptionHistoryView
 )
 from apps.subscriptions.analytics_views import SuperAdminAnalyticsView
 from apps.core.views import (
-    NotificationListView, NotificationMarkReadView
+    NotificationListView, NotificationMarkReadView, AuditLogListView
 )
 
 urlpatterns = [
@@ -40,6 +43,8 @@ urlpatterns = [
     path('auth/refresh/', TokenRefreshView.as_view(), name='api-token-refresh'),
     path('auth/logout/', LogoutView.as_view(), name='api-logout'),
     path('auth/me/', CurrentUserView.as_view(), name='api-current-user'),
+    path('auth/change-password/', ChangePasswordView.as_view(), name='api-change-password'),
+    path('auth/update-email/', EmailUpdateView.as_view(), name='api-update-email'),
 
     # OTP Account Activation & Password Reset
     path('auth/forgot-password/', ForgotPasswordView.as_view(), name='api-forgot-password'),
@@ -47,8 +52,9 @@ urlpatterns = [
     path('auth/reset-password/', ResetPasswordView.as_view(), name='api-reset-password'),
     path('auth/activate/', ActivateAccountView.as_view(), name='api-activate-account'),
 
-    # Profile
+    # Profile & Audit Trail
     path('profile/', ProfileView.as_view(), name='api-profile'),
+    path('audit-logs/', AuditLogListView.as_view(), name='api-audit-logs'),
 
     # Businesses / Enterprises (SuperAdmin & Business Admin)
     path('businesses/', BusinessListCreateView.as_view(), name='api-businesses'),
@@ -56,20 +62,26 @@ urlpatterns = [
     path('businesses/<uuid:pk>/', BusinessDetailView.as_view(), name='api-business-detail'),
     path('businesses/<uuid:pk>/stats/', BusinessStatsView.as_view(), name='api-business-stats'),
     path('businesses/<uuid:pk>/create-admin/', BusinessCreateAdminView.as_view(), name='api-business-create-admin'),
+    path('businesses/<uuid:pk>/subscription-history/', BusinessSubscriptionHistoryView.as_view(), name='api-business-sub-history'),
+    path('businesses/<uuid:pk>/centres/', BusinessCentresCapacityView.as_view(), name='api-business-centres'),
 
     # Plans & Subscriptions (SuperAdmin & Enterprise Admin)
     path('plans/', PlanListCreateView.as_view(), name='api-plans'),
     path('plans/<uuid:pk>/', PlanDetailView.as_view(), name='api-plan-detail'),
+    path('plans/<uuid:pk>/subscribers/', PlanSubscribersView.as_view(), name='api-plan-subscribers'),
     path('subscriptions/', SubscriptionDetailView.as_view(), name='api-subscriptions'),
     path('subscriptions/reallocate-capacity/', CapacityReallocateView.as_view(), name='api-capacity-reallocate'),
 
     # Brokers & Commissions (Platform SuperAdmin & Broker isolated)
     path('brokers/', BrokerListCreateView.as_view(), name='api-brokers'),
+    path('brokers/<uuid:pk>/', BrokerDetailView.as_view(), name='api-broker-detail'),
     path('brokers/dashboard/', BrokerDashboardView.as_view(), name='api-broker-dashboard'),
     path('commissions/', CommissionListView.as_view(), name='api-commissions'),
+    path('commissions/<uuid:pk>/pay/', PayCommissionView.as_view(), name='api-commission-pay'),
 
     # SuperAdmin SaaS Analytics
     path('analytics/superadmin/', SuperAdminAnalyticsView.as_view(), name='api-superadmin-analytics'),
+
 
     # Managers
     path('managers/', ManagerListView.as_view(), name='api-managers'),

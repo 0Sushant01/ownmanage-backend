@@ -6,14 +6,39 @@ from apps.subscriptions.models import (
 
 
 class PlanSerializer(serializers.ModelSerializer):
+    active_subscribers_count = serializers.SerializerMethodField()
+    total_subscribers_count = serializers.SerializerMethodField()
+    used_employee_capacity = serializers.SerializerMethodField()
+    available_employee_capacity = serializers.SerializerMethodField()
+
     class Meta:
         model = Plan
         fields = [
             'id', 'name', 'monthly_charge', 'max_centres',
             'total_employee_capacity', 'features', 'is_active',
+            'active_subscribers_count', 'total_subscribers_count',
+            'used_employee_capacity', 'available_employee_capacity',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def get_active_subscribers_count(self, obj) -> int:
+        return obj.subscriptions.filter(business__is_active=True).count()
+
+    def get_total_subscribers_count(self, obj) -> int:
+        return obj.subscriptions.count()
+
+    def get_used_employee_capacity(self, obj) -> int:
+        from apps.organization.models import Employee
+        return Employee.objects.filter(
+            business__subscription__plan=obj,
+            employment_status='ACTIVE'
+        ).count()
+
+    def get_available_employee_capacity(self, obj) -> int:
+        used = self.get_used_employee_capacity(obj)
+        total_pool = obj.total_employee_capacity * max(1, self.get_active_subscribers_count(obj))
+        return max(0, total_pool - used)
 
 
 class CentreCapacityAllocationSerializer(serializers.ModelSerializer):
@@ -41,6 +66,11 @@ class SubscriptionSerializer(serializers.ModelSerializer):
     current_employees_count = serializers.SerializerMethodField()
     total_allocated_capacity = serializers.IntegerField(read_only=True)
     unallocated_capacity = serializers.IntegerField(read_only=True)
+    days_remaining = serializers.IntegerField(read_only=True)
+    payment_status = serializers.SerializerMethodField()
+    last_payment = serializers.SerializerMethodField()
+    next_payment_due = serializers.SerializerMethodField()
+    broker = serializers.SerializerMethodField()
 
     class Meta:
         model = Subscription
@@ -48,6 +78,7 @@ class SubscriptionSerializer(serializers.ModelSerializer):
             'id', 'business', 'plan', 'plan_name', 'monthly_charge',
             'max_centres', 'total_employee_capacity', 'features',
             'status', 'start_date', 'end_date', 'current_period_start', 'current_period_end',
+            'days_remaining', 'payment_status', 'last_payment', 'next_payment_due', 'broker',
             'current_centres_count', 'current_employees_count',
             'total_allocated_capacity', 'unallocated_capacity',
             'centre_allocations', 'created_at', 'updated_at'
@@ -59,6 +90,42 @@ class SubscriptionSerializer(serializers.ModelSerializer):
 
     def get_current_employees_count(self, obj) -> int:
         return obj.business.employees.filter(employment_status='ACTIVE').count()
+
+    def get_payment_status(self, obj) -> str:
+        last_pmt = obj.payments.order_by('-billing_date').first()
+        if last_pmt:
+            return last_pmt.status
+        return 'PAID' if obj.status in ['ACTIVE', 'ACTIVE_PAID'] else 'PENDING'
+
+    def get_last_payment(self, obj):
+        last_pmt = obj.payments.filter(status='PAID').order_by('-billing_date').first()
+        if last_pmt:
+            return {
+                'amount': float(last_pmt.amount),
+                'paid_at': last_pmt.paid_at.isoformat() if last_pmt.paid_at else str(last_pmt.billing_date),
+                'invoice_number': last_pmt.invoice_number or last_pmt.payment_reference
+            }
+        return {
+            'amount': float(obj.plan.monthly_charge),
+            'paid_at': str(obj.current_period_start),
+            'invoice_number': f"INV-{str(obj.id)[:8].upper()}"
+        }
+
+    def get_next_payment_due(self, obj) -> str:
+        if obj.current_period_end:
+            return str(obj.current_period_end)
+        return str(obj.start_date)
+
+    def get_broker(self, obj):
+        ref = getattr(obj.business, 'referral', None)
+        if ref and ref.broker:
+            return {
+                'id': str(ref.broker.id),
+                'name': ref.broker.name,
+                'referral_code': ref.broker.referral_code,
+                'commission_rate': float(ref.broker.commission_rate)
+            }
+        return None
 
 
 class SubscriptionHistorySerializer(serializers.ModelSerializer):

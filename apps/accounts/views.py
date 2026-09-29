@@ -244,3 +244,104 @@ class ActivateAccountView(APIView):
 
         return Response({'detail': 'Account successfully activated. You may now log in.'}, status=status.HTTP_200_OK)
 
+
+class ChangePasswordView(APIView):
+    """
+    Authenticated password update endpoint requiring current password confirmation
+    and enforcing strong SaaS password complexity rules with audit logging.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        current_password = request.data.get('current_password', '')
+        new_password = request.data.get('new_password', '')
+        confirm_password = request.data.get('confirm_password', '')
+
+        if not current_password or not new_password or not confirm_password:
+            return Response(
+                {'detail': 'Current password, new password, and confirmation are required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not user.check_password(current_password):
+            return Response(
+                {'detail': 'Current password is incorrect.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if new_password != confirm_password:
+            return Response(
+                {'detail': 'New password and confirmation do not match.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if len(new_password) < 8:
+            return Response(
+                {'detail': 'Password must be at least 8 characters long.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        import re
+        if not re.search(r'[A-Z]', new_password):
+            return Response({'detail': 'Password must contain at least one uppercase letter.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not re.search(r'[a-z]', new_password):
+            return Response({'detail': 'Password must contain at least one lowercase letter.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not re.search(r'\d', new_password):
+            return Response({'detail': 'Password must contain at least one number.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not re.search(r'[@$!%*?&#^()_\-+=\[\]{}|~]', new_password):
+            return Response({'detail': 'Password must contain at least one special character (@$!%*?&# etc.).'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user.set_password(new_password)
+        user.save(update_fields=['password'])
+
+        from apps.core.audit import record_audit_log
+        record_audit_log(
+            action='PASSWORD_CHANGED',
+            entity_type='User',
+            entity_id=str(user.id),
+            actor=user,
+            request=request
+        )
+
+        return Response({'detail': 'Password updated successfully.'}, status=status.HTTP_200_OK)
+
+
+class EmailUpdateView(APIView):
+    """
+    Authenticated email update endpoint. Checks uniqueness and safely updates identity.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        new_email = request.data.get('email', '').strip().lower()
+
+        if not new_email:
+            return Response({'detail': 'New email address is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if new_email == user.email:
+            return Response({'detail': 'New email is identical to current email.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from apps.accounts.models import User
+        if User.objects.filter(email=new_email).exclude(id=user.id).exists():
+            return Response({'detail': 'A user with this email address already exists.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        old_email = user.email
+        user.email = new_email
+        user.save(update_fields=['email'])
+
+        from apps.core.audit import record_audit_log
+        record_audit_log(
+            action='EMAIL_CHANGED',
+            entity_type='User',
+            entity_id=str(user.id),
+            actor=user,
+            old_data={'email': old_email},
+            new_data={'email': new_email},
+            request=request
+        )
+
+        return Response({'detail': 'Email updated successfully.', 'email': new_email}, status=status.HTTP_200_OK)
+
+

@@ -92,6 +92,9 @@ DATABASES = {
         'PASSWORD': os.getenv('DB_PASSWORD', ''),
         'HOST': os.getenv('DB_HOST', ''),
         'PORT': os.getenv('DB_PORT', '5432'),
+        'OPTIONS': {
+            'sslmode': 'require',
+        },
     }
 }
 
@@ -176,7 +179,14 @@ if DEBUG:
     ]:
         if dev_origin not in CORS_ALLOWED_ORIGINS:
             CORS_ALLOWED_ORIGINS.append(dev_origin)
+
 CORS_ALLOW_CREDENTIALS = True
+
+from corsheaders.defaults import default_headers
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'x-business-id',
+    'x-csrftoken',
+]
 
 # Email configuration for transactional OTP & system notifications
 EMAIL_BACKEND = os.getenv('DJANGO_EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
