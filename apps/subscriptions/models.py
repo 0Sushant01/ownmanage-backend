@@ -71,6 +71,9 @@ class Broker(TimeStampedUUIDModel):
         verbose_name = _('Broker')
         verbose_name_plural = _('Brokers')
         ordering = ['name']
+        indexes = [
+            models.Index(fields=['is_active'], name='idx_broker_is_active'),
+        ]
 
     def __str__(self):
         return f"{self.name} ({self.referral_code})"
@@ -138,6 +141,9 @@ class Plan(TimeStampedUUIDModel):
         verbose_name = _('Subscription Plan')
         verbose_name_plural = _('Subscription Plans')
         ordering = ['monthly_charge', 'name']
+        indexes = [
+            models.Index(fields=['is_active'], name='idx_plan_is_active'),
+        ]
 
     def __str__(self):
         return f"{self.name} (Max {self.max_centres} centres, {self.total_employee_capacity} capacity)"
@@ -173,6 +179,11 @@ class Subscription(TimeStampedUUIDModel):
     class Meta:
         verbose_name = _('Subscription')
         verbose_name_plural = _('Subscriptions')
+        indexes = [
+            models.Index(fields=['status'], name='idx_sub_status'),
+            models.Index(fields=['current_period_end'], name='idx_sub_period_end'),
+            models.Index(fields=['status', 'current_period_end'], name='idx_sub_status_end'),
+        ]
 
     def __str__(self):
         return f"{self.business} - {self.plan.name} ({self.status})"

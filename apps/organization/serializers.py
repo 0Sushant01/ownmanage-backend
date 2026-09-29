@@ -61,7 +61,11 @@ class BusinessSerializer(serializers.ModelSerializer):
 
     def get_payment_status(self, obj) -> str:
         if hasattr(obj, 'subscription') and obj.subscription:
-            last_pmt = obj.subscription.payments.order_by('-billing_date').first()
+            payments = getattr(obj.subscription, 'prefetched_payments', None)
+            if payments is not None:
+                last_pmt = payments[0] if payments else None
+            else:
+                last_pmt = obj.subscription.payments.order_by('-billing_date').first()
             if last_pmt:
                 return last_pmt.status
             return 'PAID' if obj.subscription.status in ['ACTIVE', 'ACTIVE_PAID'] else 'PENDING'
@@ -83,6 +87,8 @@ class BusinessSerializer(serializers.ModelSerializer):
         return 0
 
     def get_total_centres(self, obj) -> int:
+        if hasattr(obj, 'annotated_total_centres'):
+            return obj.annotated_total_centres
         return obj.branches.filter(is_active=True).count()
 
     def get_employee_capacity(self, obj) -> int:
@@ -91,9 +97,13 @@ class BusinessSerializer(serializers.ModelSerializer):
         return 0
 
     def get_active_employees_count(self, obj) -> int:
+        if hasattr(obj, 'annotated_active_employees_count'):
+            return obj.annotated_active_employees_count
         return obj.employees.filter(employment_status='ACTIVE').count()
 
     def get_managers_count(self, obj) -> int:
+        if hasattr(obj, 'annotated_managers_count'):
+            return obj.annotated_managers_count
         return obj.memberships.filter(role=BusinessRole.MANAGER, is_active=True).count()
 
     def get_broker_name(self, obj) -> str | None:

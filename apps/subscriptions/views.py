@@ -3,6 +3,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied, NotFound, ValidationError
 
+from django.db.models import Count, Q
 from apps.core.permissions import get_user_context
 from apps.organization.models import Business, Branch, BusinessRole
 from apps.subscriptions.models import (
@@ -17,11 +18,26 @@ from apps.subscriptions.serializers import (
 from apps.subscriptions.services import allocate_centre_capacity, change_subscription_plan
 
 
+def get_annotated_plans_queryset():
+    return Plan.objects.annotate(
+        annotated_total_subscribers=Count('subscriptions', distinct=True),
+        annotated_active_subscribers=Count('subscriptions', filter=Q(subscriptions__business__is_active=True), distinct=True),
+        annotated_used_capacity=Count(
+            'subscriptions__business__employees',
+            filter=Q(
+                subscriptions__business__employees__employment_status='ACTIVE',
+                subscriptions__business__is_active=True
+            ),
+            distinct=True
+        )
+    )
+
+
 class PlanListCreateView(views.APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        qs = Plan.objects.filter(is_active=True).order_by('monthly_charge')
+        qs = get_annotated_plans_queryset().filter(is_active=True).order_by('monthly_charge')
         return Response(PlanSerializer(qs, many=True).data)
 
     def post(self, request):
@@ -39,7 +55,7 @@ class PlanDetailView(views.APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, pk):
-        plan = Plan.objects.filter(id=pk).first()
+        plan = get_annotated_plans_queryset().filter(id=pk).first()
         if not plan:
             raise NotFound('Plan not found.')
         return Response(PlanSerializer(plan).data)

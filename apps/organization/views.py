@@ -14,8 +14,27 @@ from apps.organization.serializers import (
     EmployeeListSerializer, EmployeeDetailSerializer, EmployeeCreateSerializer,
     ManagerCreateSerializer, BusinessCreateAdminSerializer
 )
+from django.db.models import Count, Q, Prefetch
 from apps.attendance.models import AttendanceDay, AttendanceStatus
 from apps.leaves.models import LeaveRequest, LeaveRequestStatus
+
+
+def get_annotated_businesses_queryset():
+    from apps.subscriptions.models import SubscriptionPayment
+    return Business.objects.select_related(
+        'subscription__plan',
+        'referral__broker'
+    ).prefetch_related(
+        Prefetch(
+            'subscription__payments',
+            queryset=SubscriptionPayment.objects.order_by('-billing_date'),
+            to_attr='prefetched_payments'
+        )
+    ).annotate(
+        annotated_total_centres=Count('branches', filter=Q(branches__is_active=True), distinct=True),
+        annotated_active_employees_count=Count('employees', filter=Q(employees__employment_status='ACTIVE'), distinct=True),
+        annotated_managers_count=Count('memberships', filter=Q(memberships__role=BusinessRole.MANAGER, memberships__is_active=True), distinct=True),
+    )
 
 
 class BusinessListCreateView(views.APIView):
@@ -24,10 +43,11 @@ class BusinessListCreateView(views.APIView):
     def get(self, request):
         ctx = get_user_context(request)
         if ctx['is_superadmin']:
-            qs = Business.objects.all().order_by('-created_at')
+            qs = get_annotated_businesses_queryset().order_by('-created_at')
             return Response(BusinessSerializer(qs, many=True).data)
         elif ctx['business']:
-            return Response(BusinessSerializer([ctx['business']], many=True).data)
+            biz = get_annotated_businesses_queryset().filter(id=ctx['business'].id).first()
+            return Response(BusinessSerializer([biz] if biz else [], many=True).data)
         raise PermissionDenied('No business association found.')
 
     def post(self, request):
@@ -46,12 +66,13 @@ class BusinessDetailView(views.APIView):
     def get_object(self, request, pk):
         ctx = get_user_context(request)
         if ctx['is_superadmin']:
-            biz = Business.objects.filter(id=pk).first()
+            biz = get_annotated_businesses_queryset().filter(id=pk).first()
             if not biz:
                 raise NotFound('Business not found.')
             return biz
         if ctx['business'] and str(ctx['business'].id) == str(pk):
-            return ctx['business']
+            biz = get_annotated_businesses_queryset().filter(id=pk).first()
+            return biz or ctx['business']
         raise PermissionDenied('You do not have access to this business.')
 
     def get(self, request, pk):
@@ -265,6 +286,7 @@ class EmployeeListView(views.APIView):
         if status_filter:
             qs = qs.filter(employment_status=status_filter.upper())
 
+        qs = qs.select_related('department', 'branch', 'manager')
         return Response(EmployeeListSerializer(qs.order_by('first_name'), many=True).data)
 
     def post(self, request):

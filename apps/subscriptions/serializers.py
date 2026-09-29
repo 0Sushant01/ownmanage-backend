@@ -23,12 +23,18 @@ class PlanSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
     def get_active_subscribers_count(self, obj) -> int:
+        if hasattr(obj, 'annotated_active_subscribers'):
+            return obj.annotated_active_subscribers
         return obj.subscriptions.filter(business__is_active=True).count()
 
     def get_total_subscribers_count(self, obj) -> int:
+        if hasattr(obj, 'annotated_total_subscribers'):
+            return obj.annotated_total_subscribers
         return obj.subscriptions.count()
 
     def get_used_employee_capacity(self, obj) -> int:
+        if hasattr(obj, 'annotated_used_capacity'):
+            return obj.annotated_used_capacity
         from apps.organization.models import Employee
         return Employee.objects.filter(
             business__subscription__plan=obj,

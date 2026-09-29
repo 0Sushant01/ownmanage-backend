@@ -83,6 +83,9 @@ class Business(TimeStampedUUIDModel):
         verbose_name = _('Business')
         verbose_name_plural = _('Businesses')
         ordering = ['name']
+        indexes = [
+            models.Index(fields=['is_active'], name='idx_biz_is_active'),
+        ]
 
     def __str__(self):
         return self.name

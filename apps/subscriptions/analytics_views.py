@@ -1,6 +1,6 @@
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from django.db.models import Sum, Count, Q
+from django.db.models import Sum, Count, Q, Prefetch
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.views import APIView
@@ -67,74 +67,69 @@ class SuperAdminAnalyticsView(APIView):
             else:
                 businesses_qs = businesses_qs.filter(subscription__status=sub_status)
 
-        # 4. KPI Calculations
-        total_biz = businesses_qs.count()
-        new_biz = businesses_qs.filter(created_at__date__gte=start_date, created_at__date__lte=end_date).count()
-        prev_new_biz = businesses_qs.filter(created_at__date__gte=prev_start, created_at__date__lte=prev_end).count()
-        biz_growth_pct = self._calculate_growth(new_biz, prev_new_biz)
-
-        active_biz = businesses_qs.filter(is_active=True).count()
+        # 4. KPI Calculations (Optimized to bulk aggregations)
+        biz_agg = businesses_qs.aggregate(
+            total=Count('id'),
+            new=Count('id', filter=Q(created_at__date__gte=start_date, created_at__date__lte=end_date)),
+            prev_new=Count('id', filter=Q(created_at__date__gte=prev_start, created_at__date__lte=prev_end)),
+            active=Count('id', filter=Q(is_active=True)),
+        )
+        total_biz = biz_agg['total']
+        new_biz = biz_agg['new']
+        prev_new_biz = biz_agg['prev_new']
+        active_biz = biz_agg['active']
         inactive_biz = max(0, total_biz - active_biz)
         active_pct = round((active_biz / total_biz * 100) if total_biz > 0 else 0.0, 1)
+        biz_growth_pct = self._calculate_growth(new_biz, prev_new_biz)
 
-        total_emp = Employee.objects.filter(business__in=businesses_qs).count()
-        active_emp = Employee.objects.filter(business__in=businesses_qs, employment_status=EmploymentStatus.ACTIVE).count()
+        emp_agg = Employee.objects.filter(business__in=businesses_qs).aggregate(
+            total=Count('id'),
+            active=Count('id', filter=Q(employment_status=EmploymentStatus.ACTIVE)),
+            prev=Count('id', filter=Q(created_at__date__lte=prev_end)),
+        )
+        total_emp = emp_agg['total']
+        active_emp = emp_agg['active']
         inactive_emp = max(0, total_emp - active_emp)
-        prev_emp = Employee.objects.filter(
-            business__in=businesses_qs,
-            created_at__date__lte=prev_end
-        ).count()
-        emp_growth_pct = self._calculate_growth(total_emp, prev_emp)
+        emp_growth_pct = self._calculate_growth(total_emp, emp_agg['prev'])
 
         # Revenue aggregations for selected window
         payments_qs = SubscriptionPayment.objects.filter(business__in=businesses_qs)
-
-        current_paid_revenue = payments_qs.filter(
-            status=PaymentStatus.PAID,
-            billing_date__gte=start_date,
-            billing_date__lte=end_date
-        ).aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
-
-        prev_paid_revenue = payments_qs.filter(
-            status=PaymentStatus.PAID,
-            billing_date__gte=prev_start,
-            billing_date__lte=prev_end
-        ).aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
-
+        payments_agg = payments_qs.aggregate(
+            current_paid=Sum('amount', filter=Q(status=PaymentStatus.PAID, billing_date__gte=start_date, billing_date__lte=end_date)),
+            prev_paid=Sum('amount', filter=Q(status=PaymentStatus.PAID, billing_date__gte=prev_start, billing_date__lte=prev_end)),
+            pending_amount=Sum('amount', filter=Q(status__in=[PaymentStatus.PENDING, PaymentStatus.OVERDUE], billing_date__gte=start_date, billing_date__lte=end_date)),
+            pending_biz_count=Count('business', distinct=True, filter=Q(status__in=[PaymentStatus.PENDING, PaymentStatus.OVERDUE], billing_date__gte=start_date, billing_date__lte=end_date)),
+        )
+        current_paid_revenue = payments_agg['current_paid'] or Decimal('0.00')
+        prev_paid_revenue = payments_agg['prev_paid'] or Decimal('0.00')
         revenue_growth_pct = self._calculate_growth(current_paid_revenue, prev_paid_revenue)
+        payment_due_amount = payments_agg['pending_amount'] or Decimal('0.00')
+        payment_due_biz_count = payments_agg['pending_biz_count']
 
         # Subscriptions KPI calculations
-        active_subs = Subscription.objects.filter(
-            business__in=businesses_qs,
-            status__in=[SubscriptionStatus.ACTIVE, SubscriptionStatus.ACTIVE_PAID]
-        ).count()
-        expiring_soon_subs = Subscription.objects.filter(
-            business__in=businesses_qs,
-            current_period_end__gte=today,
-            current_period_end__lte=today + timedelta(days=7)
-        ).count()
-        expired_subs = Subscription.objects.filter(
-            business__in=businesses_qs,
-            current_period_end__lt=today
-        ).count()
-
-        pending_payments = payments_qs.filter(
-            status__in=[PaymentStatus.PENDING, PaymentStatus.OVERDUE],
-            billing_date__gte=start_date,
-            billing_date__lte=end_date
+        sub_agg = Subscription.objects.filter(business__in=businesses_qs).aggregate(
+            active=Count('id', filter=Q(status__in=[SubscriptionStatus.ACTIVE, SubscriptionStatus.ACTIVE_PAID])),
+            expiring_soon=Count('id', filter=Q(current_period_end__gte=today, current_period_end__lte=today + timedelta(days=7))),
+            expired=Count('id', filter=Q(current_period_end__lt=today)),
         )
-        payment_due_amount = pending_payments.aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
-        payment_due_biz_count = pending_payments.values('business').distinct().count()
+        active_subs = sub_agg['active']
+        expiring_soon_subs = sub_agg['expiring_soon']
+        expired_subs = sub_agg['expired']
 
         # Broker commission payable KPI
         comm_pending_qs = Commission.objects.filter(status=CommissionStatus.PENDING)
-        comm_pending_amount = comm_pending_qs.aggregate(sum=Sum('commission_amount'))['sum'] or Decimal('0.00')
-        comm_pending_brokers_count = comm_pending_qs.values('broker').distinct().count()
+        comm_agg = comm_pending_qs.aggregate(
+            amount=Sum('commission_amount'),
+            brokers_count=Count('broker', distinct=True),
+        )
+        comm_pending_amount = comm_agg['amount'] or Decimal('0.00')
+        comm_pending_brokers_count = comm_agg['brokers_count']
 
         # 5. Charts
-        growth_chart = self._generate_growth_chart(businesses_qs, today)
-        revenue_chart = self._generate_revenue_chart(businesses_qs, today)
-        subscription_growth_chart = self._generate_subscription_growth_chart(businesses_qs, today)
+        months_info = self._get_months_info(today)
+        growth_chart = self._generate_growth_chart(businesses_qs, months_info)
+        revenue_chart = self._generate_revenue_chart(businesses_qs, months_info)
+        subscription_growth_chart = self._generate_subscription_growth_chart(businesses_qs, months_info, today)
 
         # 6. Status Breakdown & Plan Distribution
         status_breakdown = self._generate_status_breakdown(businesses_qs)
@@ -240,37 +235,34 @@ class SuperAdminAnalyticsView(APIView):
             return round(100.0 if c > 0 else 0.0, 1)
         return round(((c - p) / p) * 100.0, 1)
 
-    def _generate_growth_chart(self, businesses_qs, today: date):
-        """Generates 6 monthly data points for the Business Growth line/area chart."""
-        points = []
+    def _get_months_info(self, today: date):
+        """Precomputes 6 monthly calendar boundaries for all chart calculations."""
+        months_info = []
         for i in range(5, -1, -1):
-            # Compute month anchor
             year = today.year
             month = today.month - i
             while month <= 0:
                 month += 12
                 year -= 1
+            m_start = date(year, month, 1)
+            m_end = (m_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+            label = m_start.strftime('%b %y')
+            months_info.append({'label': label, 'start': m_start, 'end': m_end})
+        return months_info
 
-            month_start = date(year, month, 1)
-            month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
-            label = month_start.strftime('%b %y')
-
-            total = businesses_qs.filter(created_at__date__lte=month_end).count()
-            new = businesses_qs.filter(
-                created_at__date__gte=month_start,
-                created_at__date__lte=month_end
-            ).count()
-            active = businesses_qs.filter(
-                created_at__date__lte=month_end,
-                is_active=True
-            ).count()
-            churned = businesses_qs.filter(
-                created_at__date__lte=month_end,
-                subscription__status__in=[SubscriptionStatus.CANCELLED, SubscriptionStatus.SUSPENDED]
-            ).count()
-
+    def _generate_growth_chart(self, businesses_qs, months_info):
+        """Generates 6 monthly data points for Business Growth using a single bulk query."""
+        biz_data = list(businesses_qs.values('created_at__date', 'is_active', 'subscription__status'))
+        points = []
+        for m in months_info:
+            month_start = m['start']
+            month_end = m['end']
+            total = sum(1 for b in biz_data if b['created_at__date'] <= month_end)
+            new = sum(1 for b in biz_data if month_start <= b['created_at__date'] <= month_end)
+            active = sum(1 for b in biz_data if b['created_at__date'] <= month_end and b['is_active'])
+            churned = sum(1 for b in biz_data if b['created_at__date'] <= month_end and b['subscription__status'] in [SubscriptionStatus.CANCELLED, SubscriptionStatus.SUSPENDED])
             points.append({
-                'month': label,
+                'month': m['label'],
                 'total': total,
                 'new': new,
                 'active': active,
@@ -278,85 +270,64 @@ class SuperAdminAnalyticsView(APIView):
             })
         return points
 
-    def _generate_revenue_chart(self, businesses_qs, today: date):
-        """Generates 6 monthly data points for the Subscription Revenue trend chart."""
+    def _generate_revenue_chart(self, businesses_qs, months_info):
+        """Generates 6 monthly data points for Subscription Revenue using a single bulk query."""
+        earliest_start = months_info[0]['start']
+        latest_end = months_info[-1]['end']
+        pmts = list(SubscriptionPayment.objects.filter(
+            business__in=businesses_qs,
+            billing_date__gte=earliest_start,
+            billing_date__lte=latest_end
+        ).values('billing_date', 'status', 'amount'))
+
         points = []
-        for i in range(5, -1, -1):
-            year = today.year
-            month = today.month - i
-            while month <= 0:
-                month += 12
-                year -= 1
-
-            month_start = date(year, month, 1)
-            month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
-            label = month_start.strftime('%b %y')
-
-            pmts = SubscriptionPayment.objects.filter(
-                business__in=businesses_qs,
-                billing_date__gte=month_start,
-                billing_date__lte=month_end
-            )
-
-            paid = pmts.filter(status=PaymentStatus.PAID).aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
-            pending = pmts.filter(status__in=[PaymentStatus.PENDING, PaymentStatus.OVERDUE]).aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
+        for m in months_info:
+            month_start = m['start']
+            month_end = m['end']
+            paid = sum((p['amount'] for p in pmts if month_start <= p['billing_date'] <= month_end and p['status'] == PaymentStatus.PAID), Decimal('0.00'))
+            pending = sum((p['amount'] for p in pmts if month_start <= p['billing_date'] <= month_end and p['status'] in [PaymentStatus.PENDING, PaymentStatus.OVERDUE]), Decimal('0.00'))
             total = paid + pending
-
             points.append({
-                'month': label,
+                'month': m['label'],
                 'total_revenue': float(total),
                 'paid_amount': float(paid),
                 'pending_amount': float(pending),
             })
         return points
 
-    def _generate_subscription_growth_chart(self, businesses_qs, today: date):
-        """
-        Generates 6 monthly data points for Subscription Growth graph:
-        New subscriptions, Renewals, Upgrades, Downgrades, Expired, Cancelled.
-        """
+    def _generate_subscription_growth_chart(self, businesses_qs, months_info, today: date):
+        """Generates 6 monthly data points for Subscription Growth using 2 bulk queries."""
+        earliest_start = months_info[0]['start']
+        latest_end = months_info[-1]['end']
+
+        hist_data = list(SubscriptionHistory.objects.filter(
+            business__in=businesses_qs,
+            effective_from__gte=earliest_start,
+            effective_from__lte=latest_end
+        ).values('effective_from', 'action'))
+
+        subs_data = list(Subscription.objects.filter(
+            business__in=businesses_qs
+        ).values('start_date', 'current_period_end'))
+
         points = []
-        for i in range(5, -1, -1):
-            year = today.year
-            month = today.month - i
-            while month <= 0:
-                month += 12
-                year -= 1
+        for m in months_info:
+            month_start = m['start']
+            month_end = m['end']
 
-            month_start = date(year, month, 1)
-            month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
-            label = month_start.strftime('%b %y')
+            new_subs = sum(1 for h in hist_data if month_start <= h['effective_from'] <= month_end and h['action'] == 'INITIAL')
+            upgrades = sum(1 for h in hist_data if month_start <= h['effective_from'] <= month_end and h['action'] == 'UPGRADE')
+            downgrades = sum(1 for h in hist_data if month_start <= h['effective_from'] <= month_end and h['action'] == 'DOWNGRADE')
+            renewals = sum(1 for h in hist_data if month_start <= h['effective_from'] <= month_end and h['action'] == 'RENEWAL')
+            cancelled = sum(1 for h in hist_data if month_start <= h['effective_from'] <= month_end and h['action'] == 'CANCEL')
 
-            # Historical subscription actions within this month
-            hist_qs = SubscriptionHistory.objects.filter(
-                business__in=businesses_qs,
-                effective_from__gte=month_start,
-                effective_from__lte=month_end
-            )
-
-            new_subs = hist_qs.filter(action='INITIAL').count()
-            upgrades = hist_qs.filter(action='UPGRADE').count()
-            downgrades = hist_qs.filter(action='DOWNGRADE').count()
-            renewals = hist_qs.filter(action='RENEWAL').count()
-            cancelled = hist_qs.filter(action='CANCEL').count()
-
-            # If no history yet in this period, count current subscriptions started in that month
             if new_subs == 0:
-                new_subs = Subscription.objects.filter(
-                    business__in=businesses_qs,
-                    start_date__gte=month_start,
-                    start_date__lte=month_end
-                ).count()
+                new_subs = sum(1 for s in subs_data if s['start_date'] and month_start <= s['start_date'] <= month_end)
 
-            expired = Subscription.objects.filter(
-                business__in=businesses_qs,
-                current_period_end__gte=month_start,
-                current_period_end__lte=month_end,
-                current_period_end__lt=today
-            ).count()
+            expired = sum(1 for s in subs_data if s['current_period_end'] and month_start <= s['current_period_end'] <= month_end and s['current_period_end'] < today)
 
             points.append({
-                'month': label,
+                'month': m['label'],
                 'new': new_subs,
                 'renewals': renewals,
                 'upgrades': upgrades,
@@ -368,14 +339,14 @@ class SuperAdminAnalyticsView(APIView):
         return points
 
     def _generate_expiring_subscriptions(self, businesses_qs, today: date):
-        """
-        Builds the Expiring Subscriptions table data.
-        Highlights: 0-3 days critical, 4-7 days warning, 8-30 days upcoming.
-        """
+        """Builds the Expiring Subscriptions table data with prefetching to eliminate N+1."""
         subs = Subscription.objects.filter(
             business__in=businesses_qs,
             current_period_end__isnull=False
-        ).select_related('business', 'plan').prefetch_related('business__referral__broker').order_by('current_period_end')
+        ).select_related('business', 'plan').prefetch_related(
+            'business__referral__broker',
+            Prefetch('payments', queryset=SubscriptionPayment.objects.order_by('-billing_date'), to_attr='prefetched_payments')
+        ).order_by('current_period_end')
 
         results = []
         for s in subs:
@@ -389,7 +360,8 @@ class SuperAdminAnalyticsView(APIView):
                     urgency = 'upcoming'
 
                 ref = getattr(s.business, 'referral', None)
-                last_pmt = s.payments.order_by('-billing_date').first()
+                payments = getattr(s, 'prefetched_payments', None)
+                last_pmt = payments[0] if payments else None
                 payment_status = last_pmt.status if last_pmt else ('PAID' if s.status in ['ACTIVE', 'ACTIVE_PAID'] else 'PENDING')
 
                 results.append({
@@ -406,9 +378,8 @@ class SuperAdminAnalyticsView(APIView):
                 })
         return results
 
-
     def _generate_status_breakdown(self, businesses_qs):
-        """Categorizes subscriptions by status and computes revenue totals."""
+        """Categorizes subscriptions by status and computes revenue totals using grouped aggregation."""
         statuses = [
             ('ACTIVE_PAID', 'Active Paid', ['ACTIVE', 'ACTIVE_PAID']),
             ('TRIAL', 'Trial', ['TRIAL']),
@@ -420,12 +391,19 @@ class SuperAdminAnalyticsView(APIView):
         ]
 
         total_biz = businesses_qs.count()
-        items = []
-        total_paid_revenue = Decimal('0.00')
-        total_pending_revenue = Decimal('0.00')
+        status_counts_raw = dict(
+            businesses_qs.values('subscription__status').annotate(c=Count('id')).values_list('subscription__status', 'c')
+        )
+        rev_agg = SubscriptionPayment.objects.filter(business__in=businesses_qs).aggregate(
+            paid=Sum('amount', filter=Q(status=PaymentStatus.PAID)),
+            pending=Sum('amount', filter=Q(status__in=[PaymentStatus.PENDING, PaymentStatus.OVERDUE]))
+        )
+        paid_rev = rev_agg['paid'] or Decimal('0.00')
+        pending_rev = rev_agg['pending'] or Decimal('0.00')
 
+        items = []
         for key, label, match_list in statuses:
-            count = businesses_qs.filter(subscription__status__in=match_list).count()
+            count = sum(status_counts_raw.get(s, 0) for s in match_list)
             pct = round((count / total_biz * 100) if total_biz > 0 else 0.0, 1)
             items.append({
                 'key': key,
@@ -434,17 +412,6 @@ class SuperAdminAnalyticsView(APIView):
                 'percentage': pct,
             })
 
-        # Calculate revenue by status
-        paid_rev = SubscriptionPayment.objects.filter(
-            business__in=businesses_qs,
-            status=PaymentStatus.PAID
-        ).aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
-
-        pending_rev = SubscriptionPayment.objects.filter(
-            business__in=businesses_qs,
-            status__in=[PaymentStatus.PENDING, PaymentStatus.OVERDUE]
-        ).aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
-
         return {
             'statuses': items,
             'paid_revenue': float(paid_rev),
@@ -452,26 +419,28 @@ class SuperAdminAnalyticsView(APIView):
         }
 
     def _generate_plan_distribution(self, businesses_qs):
-        """Computes business distribution and revenue per commercial plan."""
-        plans = Plan.objects.all().order_by('monthly_charge')
+        """Computes business distribution and revenue per commercial plan using bulk annotations."""
+        plans = list(Plan.objects.all().order_by('monthly_charge'))
+        biz_plan_stats = {
+            row['subscription__plan']: row
+            for row in businesses_qs.values('subscription__plan').annotate(
+                biz_count=Count('id'),
+                active_count=Count('id', filter=Q(is_active=True)),
+                paid_count=Count('id', filter=Q(subscription__status__in=[SubscriptionStatus.ACTIVE, SubscriptionStatus.ACTIVE_PAID]))
+            )
+        }
+        rev_plan_stats = {
+            row['plan']: row['rev']
+            for row in SubscriptionPayment.objects.filter(business__in=businesses_qs, status=PaymentStatus.PAID).values('plan').annotate(rev=Sum('amount'))
+        }
+
         distribution = []
-
         for p in plans:
-            biz_count = businesses_qs.filter(subscription__plan=p).count()
-            active_count = businesses_qs.filter(
-                subscription__plan=p,
-                is_active=True
-            ).count()
-            paid_count = businesses_qs.filter(
-                subscription__plan=p,
-                subscription__status__in=[SubscriptionStatus.ACTIVE, SubscriptionStatus.ACTIVE_PAID]
-            ).count()
-
-            rev = SubscriptionPayment.objects.filter(
-                business__in=businesses_qs,
-                plan=p,
-                status=PaymentStatus.PAID
-            ).aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
+            p_stat = biz_plan_stats.get(p.id, {})
+            biz_count = p_stat.get('biz_count', 0)
+            active_count = p_stat.get('active_count', 0)
+            paid_count = p_stat.get('paid_count', 0)
+            rev = rev_plan_stats.get(p.id, Decimal('0.00')) or Decimal('0.00')
 
             distribution.append({
                 'id': str(p.id),
@@ -487,27 +456,25 @@ class SuperAdminAnalyticsView(APIView):
         return distribution
 
     def _generate_broker_performance(self):
-        """Summarizes client acquisition and commissions for top brokers."""
-        brokers = Broker.objects.all().prefetch_related('referrals', 'commissions')
+        """Summarizes client acquisition and commissions for brokers using bulk prefetched data."""
+        brokers = list(Broker.objects.all())
+        refs = list(Referral.objects.select_related('business').all())
+        comms = list(Commission.objects.all())
+        pmts_rev = dict(
+            SubscriptionPayment.objects.filter(status=PaymentStatus.PAID).values('business_id').annotate(s=Sum('amount')).values_list('business_id', 's')
+        )
+
         performance = []
-
         for b in brokers:
-            referred_count = b.referrals.count()
-            active_count = b.referrals.filter(business__is_active=True).count()
+            b_refs = [r for r in refs if r.broker_id == b.id]
+            b_comms = [c for c in comms if c.broker_id == b.id]
 
-            biz_ids = b.referrals.values_list('business_id', flat=True)
-            rev = SubscriptionPayment.objects.filter(
-                business_id__in=biz_ids,
-                status=PaymentStatus.PAID
-            ).aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
+            referred_count = len(b_refs)
+            active_count = sum(1 for r in b_refs if r.business.is_active)
+            total_rev = sum((pmts_rev.get(r.business_id, Decimal('0.00')) for r in b_refs), Decimal('0.00'))
 
-            comm_paid = b.commissions.filter(
-                status=CommissionStatus.PAID
-            ).aggregate(sum=Sum('commission_amount'))['sum'] or Decimal('0.00')
-
-            comm_pending = b.commissions.filter(
-                status=CommissionStatus.PENDING
-            ).aggregate(sum=Sum('commission_amount'))['sum'] or Decimal('0.00')
+            comm_paid = sum((c.commission_amount for c in b_comms if c.status == CommissionStatus.PAID), Decimal('0.00'))
+            comm_pending = sum((c.commission_amount for c in b_comms if c.status == CommissionStatus.PENDING), Decimal('0.00'))
 
             performance.append({
                 'id': str(b.id),
@@ -516,17 +483,19 @@ class SuperAdminAnalyticsView(APIView):
                 'commission_rate': float(b.commission_rate),
                 'referred_businesses': referred_count,
                 'active_businesses': active_count,
-                'total_revenue': float(rev),
+                'total_revenue': float(total_rev),
                 'commissions_paid': float(comm_paid),
                 'commissions_pending': float(comm_pending),
             })
         return performance
 
     def _generate_action_required(self, today: date):
-        """Computes operational items needing SuperAdmin intervention."""
-        overdue_payments = SubscriptionPayment.objects.filter(status=PaymentStatus.OVERDUE)
-        overdue_count = overdue_payments.count()
-        overdue_amount = overdue_payments.aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
+        """Computes operational items needing SuperAdmin intervention using combined aggregations."""
+        overdue_agg = SubscriptionPayment.objects.filter(status=PaymentStatus.OVERDUE).aggregate(
+            c=Count('id'), s=Sum('amount')
+        )
+        overdue_count = overdue_agg['c']
+        overdue_amount = overdue_agg['s'] or Decimal('0.00')
 
         expiring_soon_count = Subscription.objects.filter(
             current_period_end__gte=today,
@@ -537,9 +506,11 @@ class SuperAdminAnalyticsView(APIView):
             Q(is_active=False) | Q(subscription__status=SubscriptionStatus.SUSPENDED)
         ).distinct().count()
 
-        commissions_pending_qs = Commission.objects.filter(status=CommissionStatus.PENDING)
-        commissions_pending_count = commissions_pending_qs.count()
-        commissions_pending_amount = commissions_pending_qs.aggregate(sum=Sum('commission_amount'))['sum'] or Decimal('0.00')
+        comm_agg = Commission.objects.filter(status=CommissionStatus.PENDING).aggregate(
+            c=Count('id'), s=Sum('commission_amount')
+        )
+        commissions_pending_count = comm_agg['c']
+        commissions_pending_amount = comm_agg['s'] or Decimal('0.00')
 
         trials_count = Subscription.objects.filter(status=SubscriptionStatus.TRIAL).count()
 

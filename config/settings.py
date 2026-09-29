@@ -91,10 +91,11 @@ DATABASES = {
         'USER': os.getenv('DB_USER', 'postgres'),
         'PASSWORD': os.getenv('DB_PASSWORD', ''),
         'HOST': os.getenv('DB_HOST', ''),
-        'PORT': os.getenv('DB_PORT', '5432'),
+        'PORT': os.getenv('DB_PORT', '6543'),
         'OPTIONS': {
             'sslmode': 'require',
         },
+        'CONN_MAX_AGE': int(os.getenv('DB_CONN_MAX_AGE', '0')),
     }
 }
 
