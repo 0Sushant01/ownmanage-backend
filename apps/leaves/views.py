@@ -42,12 +42,14 @@ class LeaveRequestListCreateView(views.APIView):
         elif ctx['role'] == BusinessRole.BUSINESS_ADMIN:
             qs = LeaveRequest.objects.filter(business=biz)
         elif ctx['role'] == BusinessRole.MANAGER:
-            # Manager sees leave requests of their assigned staff
+            # Manager sees leave requests of staff in their centre or direct reports
             if ctx.get('employee'):
-                qs = LeaveRequest.objects.filter(
-                    business=biz,
-                    employee__manager=ctx['employee']
-                )
+                mgr_emp = ctx['employee']
+                from django.db.models import Q
+                mgr_filter = Q(employee__manager=mgr_emp)
+                if mgr_emp.branch_id:
+                    mgr_filter |= Q(employee__branch_id=mgr_emp.branch_id)
+                qs = LeaveRequest.objects.filter(business=biz).filter(mgr_filter)
             else:
                 qs = LeaveRequest.objects.none()
         else:
@@ -57,8 +59,12 @@ class LeaveRequestListCreateView(views.APIView):
             else:
                 qs = LeaveRequest.objects.none()
 
+        centre_filter = request.query_params.get('centre_id') or request.query_params.get('branch_id')
+        if centre_filter and centre_filter not in ['all', 'ALL', 'null', '']:
+            qs = qs.filter(employee__branch_id=centre_filter)
+
         status_param = request.query_params.get('status')
-        if status_param:
+        if status_param and status_param not in ['all', 'ALL', 'null', '']:
             qs = qs.filter(status=status_param.upper())
 
         qs = qs.select_related('employee', 'leave_type', 'approved_by').order_by('-created_at')
@@ -81,24 +87,16 @@ class LeaveRequestApproveView(views.APIView):
 
     def post(self, request, pk):
         ctx = get_user_context(request)
-        leave_req = LeaveRequest.objects.filter(id=pk).select_related('employee').first()
+        leave_req = LeaveRequest.objects.filter(id=pk).select_related('employee', 'business').first()
         if not leave_req:
             raise NotFound('Leave request not found.')
-
-        # Permission check: SuperAdmin, Business Admin of the business, or Manager of the employee
-        can_approve = False
-        if ctx['is_superadmin']:
-            can_approve = True
-        elif ctx['role'] == BusinessRole.BUSINESS_ADMIN and leave_req.business_id == ctx['business'].id:
-            can_approve = True
-        elif ctx['role'] == BusinessRole.MANAGER and ctx.get('employee') and leave_req.employee.manager_id == ctx['employee'].id:
-            can_approve = True
 
         # A manager/user must never approve their own leave request
         if leave_req.employee.user_id == request.user.id:
             raise PermissionDenied('You cannot approve your own leave request.')
 
-        if not can_approve:
+        from apps.organization.services.permission_service import PermissionService
+        if not PermissionService.has_permission(request.user, 'leave.approve', business=leave_req.business, target_employee=leave_req.employee):
             raise PermissionDenied('You do not have permission to approve this leave request.')
 
         if leave_req.status != LeaveRequestStatus.PENDING:
@@ -120,19 +118,12 @@ class LeaveRequestRejectView(views.APIView):
 
     def post(self, request, pk):
         ctx = get_user_context(request)
-        leave_req = LeaveRequest.objects.filter(id=pk).select_related('employee').first()
+        leave_req = LeaveRequest.objects.filter(id=pk).select_related('employee', 'business').first()
         if not leave_req:
             raise NotFound('Leave request not found.')
 
-        can_reject = False
-        if ctx['is_superadmin']:
-            can_reject = True
-        elif ctx['role'] == BusinessRole.BUSINESS_ADMIN and leave_req.business_id == ctx['business'].id:
-            can_reject = True
-        elif ctx['role'] == BusinessRole.MANAGER and ctx.get('employee') and leave_req.employee.manager_id == ctx['employee'].id:
-            can_reject = True
-
-        if not can_reject:
+        from apps.organization.services.permission_service import PermissionService
+        if not PermissionService.has_permission(request.user, 'leave.reject', business=leave_req.business, target_employee=leave_req.employee):
             raise PermissionDenied('You do not have permission to reject this leave request.')
 
         if leave_req.status != LeaveRequestStatus.PENDING:

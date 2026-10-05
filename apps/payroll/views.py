@@ -45,12 +45,16 @@ class PayrollListView(views.APIView):
         if emp_param:
             qs = qs.filter(employee_id=emp_param)
 
+        centre_filter = request.query_params.get('centre_id') or request.query_params.get('branch_id')
+        if centre_filter and centre_filter not in ['all', 'ALL', 'null', '']:
+            qs = qs.filter(employee__branch_id=centre_filter)
+
         period_start = request.query_params.get('period_start')
         if period_start:
             qs = qs.filter(period_start__gte=period_start)
 
         status_param = request.query_params.get('status')
-        if status_param:
+        if status_param and status_param not in ['all', 'ALL', 'null', '']:
             qs = qs.filter(status=status_param.upper())
 
         qs = qs.select_related('employee', 'employee__department').prefetch_related('payslip').order_by('-period_start')

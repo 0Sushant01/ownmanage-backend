@@ -11,11 +11,11 @@ from apps.organization.views import (
     ManagerListView, ManagerDetailView,
     EmployeeListView, EmployeeDetailView, EmployeeDeactivateView, EmployeeMetadataView,
     CentreListCreateView, CentreDetailView, DepartmentListCreateView,
-    BusinessCentresCapacityView
+    BusinessCentresCapacityView, EmployeeActivityLogView
 )
 from apps.attendance.views import (
     AttendanceTodayView, AttendanceCheckInView, AttendanceCheckOutView,
-    AttendanceHistoryView, AttendanceCalendarView,
+    AttendanceHistoryView, AttendanceCalendarView, AttendanceDailyRegisterView,
     WorkScheduleListView, AttendanceCorrectionListCreateView,
     AttendanceCorrectionApproveView, AttendanceCorrectionRejectView
 )
@@ -35,6 +35,21 @@ from apps.subscriptions.views import (
 from apps.subscriptions.analytics_views import SuperAdminAnalyticsView
 from apps.core.views import (
     NotificationListView, NotificationMarkReadView, AuditLogListView
+)
+from apps.organization.access_views import (
+    PermissionListView, ManagerAccessControlView,
+    DesignationListCreateView, DesignationDetailView,
+    EmployeeDocumentListCreateView, EmployeeDocumentDetailView, EmployeeDocumentVerifyView,
+    HolidayListCreateView, HolidayDetailView
+)
+from apps.attendance.policy_views import (
+    EnterpriseAttendancePolicyView, CentreAttendancePolicyView, CentreAttendancePolicyResetView
+)
+from apps.payroll.revision_views import (
+    EmployeeSalaryRevisionListCreateView, PayrollRunListCreateView,
+    PayrollRunApproveView, PayrollRunFinalizeView,
+    EmployeeSalaryComparisonView, EmployeeCompensationItemListCreateView,
+    EmployeeCompensationItemDetailView
 )
 
 urlpatterns = [
@@ -86,29 +101,54 @@ urlpatterns = [
     # Managers
     path('managers/', ManagerListView.as_view(), name='api-managers'),
     path('managers/<uuid:pk>/', ManagerDetailView.as_view(), name='api-manager-detail'),
+    path('managers/<uuid:pk>/access-control/', ManagerAccessControlView.as_view(), name='api-manager-access-control'),
+
+    # Permissions & Granular Access Control
+    path('permissions/', PermissionListView.as_view(), name='api-permissions'),
 
     # Centres / Branches
     path('centres/', CentreListCreateView.as_view(), name='api-centres'),
     path('centres/<uuid:pk>/', CentreDetailView.as_view(), name='api-centre-detail'),
+    path('centres/<uuid:pk>/attendance-policy/', CentreAttendancePolicyView.as_view(), name='api-centre-attendance-policy'),
+    path('centres/<uuid:pk>/attendance-policy/reset/', CentreAttendancePolicyResetView.as_view(), name='api-centre-attendance-policy-reset'),
 
-    # Departments
+    # Departments & Designations
     path('departments/', DepartmentListCreateView.as_view(), name='api-departments'),
+    path('designations/', DesignationListCreateView.as_view(), name='api-designations'),
+    path('designations/<uuid:pk>/', DesignationDetailView.as_view(), name='api-designation-detail'),
+
+    # Holidays
+    path('holidays/', HolidayListCreateView.as_view(), name='api-holidays'),
+    path('holidays/<uuid:pk>/', HolidayDetailView.as_view(), name='api-holiday-detail'),
 
     # Employees
     path('employees/', EmployeeListView.as_view(), name='api-employees'),
     path('employees/metadata/', EmployeeMetadataView.as_view(), name='api-employee-metadata'),
     path('employees/<uuid:pk>/', EmployeeDetailView.as_view(), name='api-employee-detail'),
     path('employees/<uuid:pk>/deactivate/', EmployeeDeactivateView.as_view(), name='api-employee-deactivate'),
+    path('employees/<uuid:pk>/documents/', EmployeeDocumentListCreateView.as_view(), name='api-employee-documents'),
+    path('employees/<uuid:pk>/activity/', EmployeeActivityLogView.as_view(), name='api-employee-activity'),
+    path('employees/<uuid:pk>/salary-revisions/', EmployeeSalaryRevisionListCreateView.as_view(), name='api-employee-salary-revisions'),
+    path('employees/<uuid:pk>/salary-comparison/', EmployeeSalaryComparisonView.as_view(), name='api-employee-salary-comparison'),
+    path('employees/<uuid:pk>/compensation-items/', EmployeeCompensationItemListCreateView.as_view(), name='api-employee-comp-items'),
+    path('employees/<uuid:pk>/compensation-items/<uuid:comp_pk>/', EmployeeCompensationItemDetailView.as_view(), name='api-employee-comp-item-detail'),
+
+    # Documents
+    path('documents/<uuid:pk>/', EmployeeDocumentDetailView.as_view(), name='api-document-detail'),
+    path('documents/<uuid:pk>/verify/', EmployeeDocumentVerifyView.as_view(), name='api-document-verify'),
 
     # Work Schedules
     path('schedules/', WorkScheduleListView.as_view(), name='api-schedules'),
 
     # Attendance
+    path('attendance/register/', AttendanceDailyRegisterView.as_view(), name='api-attendance-register'),
+    path('attendance/daily-register/', AttendanceDailyRegisterView.as_view(), name='api-attendance-daily-register'),
     path('attendance/today/', AttendanceTodayView.as_view(), name='api-attendance-today'),
     path('attendance/check-in/', AttendanceCheckInView.as_view(), name='api-attendance-checkin'),
     path('attendance/check-out/', AttendanceCheckOutView.as_view(), name='api-attendance-checkout'),
     path('attendance/history/', AttendanceHistoryView.as_view(), name='api-attendance-history'),
     path('attendance/calendar/', AttendanceCalendarView.as_view(), name='api-attendance-calendar'),
+    path('attendance/policies/enterprise/', EnterpriseAttendancePolicyView.as_view(), name='api-attendance-policy-enterprise'),
 
     # Attendance Corrections
     path('attendance/corrections/', AttendanceCorrectionListCreateView.as_view(), name='api-attendance-corrections'),
@@ -124,6 +164,9 @@ urlpatterns = [
     # Salary & Payroll
     path('salary/payrolls/', PayrollListView.as_view(), name='api-salary-payrolls'),
     path('salary/payrolls/<uuid:pk>/', PayrollDetailView.as_view(), name='api-salary-detail'),
+    path('payroll/runs/', PayrollRunListCreateView.as_view(), name='api-payroll-runs'),
+    path('payroll/runs/<uuid:pk>/approve/', PayrollRunApproveView.as_view(), name='api-payroll-run-approve'),
+    path('payroll/runs/<uuid:pk>/finalize/', PayrollRunFinalizeView.as_view(), name='api-payroll-run-finalize'),
 
     # Notifications
     path('notifications/', NotificationListView.as_view(), name='api-notifications'),

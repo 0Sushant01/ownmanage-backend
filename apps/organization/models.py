@@ -154,6 +154,19 @@ class Branch(TimeStampedUUIDModel):
     state = models.CharField(max_length=100, blank=True, verbose_name=_('State'))
     postal_code = models.CharField(max_length=20, blank=True, verbose_name=_('Postal Code'))
     country = models.CharField(max_length=100, default='India', verbose_name=_('Country'))
+    phone = models.CharField(max_length=30, blank=True, verbose_name=_('Contact Phone'))
+    email = models.EmailField(blank=True, verbose_name=_('Contact Email'))
+    status = models.CharField(
+        max_length=20,
+        choices=[('ACTIVE', 'Active'), ('INACTIVE', 'Inactive'), ('SUSPENDED', 'Suspended')],
+        default='ACTIVE',
+        verbose_name=_('Centre Status')
+    )
+    opening_date = models.DateField(null=True, blank=True, verbose_name=_('Opening Date'))
+    latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True, verbose_name=_('Latitude'))
+    longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True, verbose_name=_('Longitude'))
+    geofence_radius = models.PositiveIntegerField(default=100, verbose_name=_('Allowed Geofence Radius (meters)'))
+    currency = models.CharField(max_length=10, default='INR', verbose_name=_('Currency'))
     timezone = models.CharField(
         max_length=50,
         blank=True,
@@ -297,6 +310,8 @@ class Employee(TimeStampedUUIDModel):
         default=EmploymentStatus.ACTIVE,
         verbose_name=_('Employment Status')
     )
+    status_reason = models.TextField(blank=True, verbose_name=_('Status Change Reason'))
+    status_effective_date = models.DateField(null=True, blank=True, verbose_name=_('Status Effective Date'))
     date_of_exit = models.DateField(null=True, blank=True, verbose_name=_('Date of Exit'))
 
     class Meta:
@@ -385,3 +400,310 @@ class EmployeeAssignment(TimeStampedUUIDModel):
 
     def __str__(self):
         return f"{self.employee} ({self.effective_from} to {self.effective_to or 'Present'})"
+
+
+class Designation(TimeStampedUUIDModel):
+    """
+    Formal organizational designation / job title configured by Enterprise.
+    Enforces uniqueness per enterprise.
+    """
+    business = models.ForeignKey(
+        Business,
+        on_delete=models.CASCADE,
+        related_name='designation_records',
+        verbose_name=_('Business')
+    )
+    name = models.CharField(max_length=150, verbose_name=_('Designation Name'))
+    code = models.CharField(max_length=50, blank=True, verbose_name=_('Designation Code'))
+    description = models.TextField(blank=True, verbose_name=_('Description'))
+    is_active = models.BooleanField(default=True, verbose_name=_('Is Active'))
+
+    class Meta:
+        verbose_name = _('Designation')
+        verbose_name_plural = _('Designations')
+        ordering = ['business', 'name']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['business', 'name'],
+                name='unique_business_designation_name'
+            )
+        ]
+        indexes = [
+            models.Index(fields=['business', 'is_active'], name='idx_desig_biz_active'),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.business.name})"
+
+
+class PermissionScope(models.TextChoices):
+    GLOBAL = 'GLOBAL', _('Global / SaaS-Wide')
+    ENTERPRISE = 'ENTERPRISE', _('Enterprise / Business')
+    CENTER = 'CENTER', _('Center / Branch')
+    SELF = 'SELF', _('Self / Own Record')
+
+
+class Permission(TimeStampedUUIDModel):
+    """
+    Canonical system permissions grouped by functional module.
+    """
+    key = models.CharField(max_length=100, unique=True, db_index=True, verbose_name=_('Permission Key'))
+    name = models.CharField(max_length=150, verbose_name=_('Permission Name'))
+    module = models.CharField(max_length=50, db_index=True, verbose_name=_('Module Group'))
+    description = models.TextField(blank=True, verbose_name=_('Description'))
+    default_scope = models.CharField(
+        max_length=30,
+        choices=PermissionScope.choices,
+        default=PermissionScope.CENTER,
+        verbose_name=_('Default Scope')
+    )
+
+    class Meta:
+        verbose_name = _('Permission')
+        verbose_name_plural = _('Permissions')
+        ordering = ['module', 'key']
+
+    def __str__(self):
+        return f"{self.module}.{self.key} ({self.name})"
+
+
+class ManagerAccessControl(TimeStampedUUIDModel):
+    """
+    Enterprise-controlled granular permissions for Center Managers.
+    Enterprise Admin configures which operations a specific manager can perform in their assigned center.
+    """
+    business = models.ForeignKey(
+        Business,
+        on_delete=models.CASCADE,
+        related_name='manager_access_controls',
+        verbose_name=_('Business')
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='manager_permissions',
+        verbose_name=_('Manager User')
+    )
+    permission = models.ForeignKey(
+        Permission,
+        on_delete=models.CASCADE,
+        related_name='manager_grants',
+        verbose_name=_('Permission')
+    )
+    is_granted = models.BooleanField(default=True, verbose_name=_('Is Granted'))
+    scope = models.CharField(
+        max_length=30,
+        choices=PermissionScope.choices,
+        default=PermissionScope.CENTER,
+        verbose_name=_('Scope')
+    )
+    granted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='granted_permissions',
+        verbose_name=_('Granted By')
+    )
+
+    class Meta:
+        verbose_name = _('Manager Access Control')
+        verbose_name_plural = _('Manager Access Controls')
+        constraints = [
+            models.UniqueConstraint(
+                fields=['business', 'user', 'permission'],
+                name='unique_business_user_permission'
+            )
+        ]
+        indexes = [
+            models.Index(fields=['business', 'user', 'is_granted'], name='idx_mgr_access_lookup'),
+        ]
+
+    def __str__(self):
+        status = "Granted" if self.is_granted else "Denied"
+        return f"{self.user} - {self.permission.key}: {status} ({self.scope})"
+
+
+class DocumentCategory(models.TextChoices):
+    IDENTITY_PROOF = 'IDENTITY_PROOF', _('Identity Proof')
+    ADDRESS_PROOF = 'ADDRESS_PROOF', _('Address Proof')
+    EDUCATION = 'EDUCATION', _('Education Certificate')
+    CONTRACT = 'CONTRACT', _('Employment Contract')
+    OFFER_LETTER = 'OFFER_LETTER', _('Offer Letter')
+    EXPERIENCE = 'EXPERIENCE', _('Experience Certificate')
+    BANK = 'BANK', _('Bank Document')
+    TAX = 'TAX', _('Tax Document')
+    OTHER = 'OTHER', _('Other')
+
+
+class VerificationStatus(models.TextChoices):
+    PENDING = 'PENDING', _('Pending Verification')
+    VERIFIED = 'VERIFIED', _('Verified')
+    REJECTED = 'REJECTED', _('Rejected')
+
+
+class EmployeeDocument(TimeStampedUUIDModel):
+    """
+    Employee document repository with verification workflow and soft deletion.
+    """
+    business = models.ForeignKey(
+        Business,
+        on_delete=models.CASCADE,
+        related_name='employee_documents',
+        verbose_name=_('Business')
+    )
+    employee = models.ForeignKey(
+        Employee,
+        on_delete=models.CASCADE,
+        related_name='documents',
+        verbose_name=_('Employee')
+    )
+    title = models.CharField(max_length=255, verbose_name=_('Document Title'))
+    category = models.CharField(
+        max_length=50,
+        choices=DocumentCategory.choices,
+        default=DocumentCategory.OTHER,
+        verbose_name=_('Category')
+    )
+    file_url = models.CharField(max_length=1000, verbose_name=_('File URL / Storage Path'))
+    file_name = models.CharField(max_length=255, verbose_name=_('File Name'))
+    file_size_bytes = models.PositiveIntegerField(default=0, verbose_name=_('File Size (Bytes)'))
+    issue_date = models.DateField(null=True, blank=True, verbose_name=_('Issue Date'))
+    expiry_date = models.DateField(null=True, blank=True, verbose_name=_('Expiry Date'))
+    verification_status = models.CharField(
+        max_length=30,
+        choices=VerificationStatus.choices,
+        default=VerificationStatus.PENDING,
+        verbose_name=_('Verification Status')
+    )
+    verified_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='verified_documents',
+        verbose_name=_('Verified By')
+    )
+    verified_at = models.DateTimeField(null=True, blank=True, verbose_name=_('Verified At'))
+    remarks = models.TextField(blank=True, verbose_name=_('Remarks / Verification Notes'))
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='uploaded_documents',
+        verbose_name=_('Uploaded By')
+    )
+    is_deleted = models.BooleanField(default=False, verbose_name=_('Is Soft Deleted'))
+    deleted_at = models.DateTimeField(null=True, blank=True, verbose_name=_('Deleted At'))
+    deleted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='deleted_documents',
+        verbose_name=_('Deleted By')
+    )
+
+    class Meta:
+        verbose_name = _('Employee Document')
+        verbose_name_plural = _('Employee Documents')
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['employee', 'is_deleted'], name='idx_emp_doc_active'),
+            models.Index(fields=['business', 'category', 'is_deleted'], name='idx_biz_doc_cat'),
+        ]
+
+    def __str__(self):
+        return f"{self.title} ({self.get_category_display()}) - {self.employee}"
+
+
+class Holiday(TimeStampedUUIDModel):
+    """
+    Holiday calendar configured by Enterprise.
+    Supports platform/enterprise wide holidays or center-specific applicability.
+    """
+    business = models.ForeignKey(
+        Business,
+        on_delete=models.CASCADE,
+        related_name='holidays',
+        verbose_name=_('Business')
+    )
+    name = models.CharField(max_length=150, verbose_name=_('Holiday Name'))
+    holiday_date = models.DateField(verbose_name=_('Holiday Date'))
+    description = models.TextField(blank=True, verbose_name=_('Description'))
+    is_optional = models.BooleanField(default=False, verbose_name=_('Is Optional / Restricted'))
+    applies_to_all_centres = models.BooleanField(
+        default=True,
+        verbose_name=_('Applies to All Centres'),
+        help_text=_('If True, holiday applies enterprise-wide. If False, only attached centres observe it.')
+    )
+    centres = models.ManyToManyField(
+        Branch,
+        blank=True,
+        related_name='holidays',
+        verbose_name=_('Specific Centres')
+    )
+
+    class Meta:
+        verbose_name = _('Holiday')
+        verbose_name_plural = _('Holidays')
+        ordering = ['holiday_date', 'name']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['business', 'holiday_date', 'name'],
+                name='unique_business_holiday_date_name'
+            )
+        ]
+        indexes = [
+            models.Index(fields=['business', 'holiday_date'], name='idx_holiday_biz_date'),
+        ]
+
+    def __str__(self):
+        scope = "All Centres" if self.applies_to_all_centres else "Selected Centres"
+        return f"{self.name} on {self.holiday_date} ({scope})"
+
+
+class EmployeeActivityLog(TimeStampedUUIDModel):
+    """
+    Chronological activity timeline tracking significant employee lifecycle changes.
+    Section 23: Tracks salary changes, centre changes, manager reassignments, and status modifications.
+    """
+    business = models.ForeignKey(
+        Business,
+        on_delete=models.CASCADE,
+        related_name='employee_activities',
+        verbose_name=_('Business')
+    )
+    employee = models.ForeignKey(
+        'organization.Employee',
+        on_delete=models.CASCADE,
+        related_name='activity_logs',
+        verbose_name=_('Employee')
+    )
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='authored_employee_activities',
+        verbose_name=_('Actor')
+    )
+    action_type = models.CharField(max_length=50, verbose_name=_('Action Type'))
+    description = models.CharField(max_length=255, verbose_name=_('Description'))
+    old_value = models.TextField(blank=True, verbose_name=_('Old Value'))
+    new_value = models.TextField(blank=True, verbose_name=_('New Value'))
+    metadata = models.JSONField(default=dict, blank=True, verbose_name=_('Metadata'))
+
+    class Meta:
+        verbose_name = _('Employee Activity Log')
+        verbose_name_plural = _('Employee Activity Logs')
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['employee', '-created_at'], name='idx_emp_act_created'),
+            models.Index(fields=['business', '-created_at'], name='idx_biz_act_created'),
+        ]
+
+    def __str__(self):
+        return f"{self.employee.full_name}: {self.action_type} at {self.created_at}"
+

@@ -32,18 +32,20 @@ def build_user_payload(user, context=None):
     active_business = None
     active_employee = None
 
+    biz_obj = None
     if user.is_superuser:
         active_role = BusinessRole.SUPERADMIN
         if context and context.get('business'):
-            b = context['business']
-            active_business = {'id': str(b.id), 'name': b.name}
+            biz_obj = context['business']
+            active_business = {'id': str(biz_obj.id), 'name': biz_obj.name}
     elif hasattr(user, 'broker_profile') and user.broker_profile.is_active:
         active_role = BusinessRole.BROKER
     elif memberships_data:
         m = memberships_qs.first()
         active_role = m.role
-        active_business = {'id': str(m.business.id), 'name': m.business.name}
-        emp = Employee.objects.filter(business=m.business, user=user).first()
+        biz_obj = m.business
+        active_business = {'id': str(biz_obj.id), 'name': biz_obj.name}
+        emp = Employee.objects.filter(business=biz_obj, user=user).first()
         if emp:
             active_employee = {
                 'id': str(emp.id),
@@ -53,12 +55,16 @@ def build_user_payload(user, context=None):
                 'branch': emp.branch.name if emp.branch else None,
             }
 
+    from apps.organization.services.permission_service import PermissionService
+    permissions_list = PermissionService.get_user_permissions(user, biz_obj)
+
     return {
         'user': UserSerializer(user).data,
         'role': active_role,
         'business': active_business,
         'employee': active_employee,
         'memberships': memberships_data,
+        'permissions': permissions_list,
     }
 
 
@@ -123,7 +129,8 @@ class ProfileView(APIView):
                 'email': e.email,
                 'phone': e.phone,
                 'designation': e.designation,
-                'joining_date': str(e.joining_date),
+                'joining_date': str(e.joining_date) if e.joining_date else None,
+                'status': getattr(e, 'employment_status', 'ACTIVE'),
                 'department': e.department.name if e.department else None,
                 'branch': e.branch.name if e.branch else None,
                 'manager': str(e.manager) if e.manager else None,

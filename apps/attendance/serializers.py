@@ -63,3 +63,41 @@ class AttendanceCorrectionSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'business', 'requested_by', 'reviewed_by', 'reviewed_at', 'created_at']
 
+
+class AttendancePolicySerializer(serializers.ModelSerializer):
+    class Meta:
+        from apps.attendance.models import AttendancePolicy
+        model = AttendancePolicy
+        fields = [
+            'id', 'business', 'office_start', 'office_end', 'break_start', 'break_end',
+            'working_days', 'weekly_off', 'weekly_off_days', 'daily_schedules',
+            'grace_period_minutes', 'minimum_present_minutes', 'minimum_half_day_minutes',
+            'late_threshold_minutes', 'early_checkout_threshold_minutes',
+            'auto_attendance', 'allow_center_override', 'ot_enabled', 'ot_grace_minutes',
+            'ot_approval_required', 'max_daily_ot_minutes', 'allow_normal_punch',
+            'allow_gps', 'allow_geofencing', 'allow_qr', 'allow_face_recognition',
+            'allow_biometric', 'gps_latitude', 'gps_longitude', 'gps_radius_meters',
+            'location_required_checkin', 'location_required_checkout',
+            'extra_settings', 'created_at'
+        ]
+        read_only_fields = ['id', 'business', 'created_at']
+
+
+class AttendancePolicyOverrideSerializer(serializers.ModelSerializer):
+    class Meta:
+        from apps.attendance.models import AttendancePolicyOverride
+        model = AttendancePolicyOverride
+        fields = [
+            'id', 'centre', 'office_start', 'office_end', 'break_start', 'break_end',
+            'weekly_off', 'weekly_off_days', 'daily_schedules',
+            'grace_period_minutes', 'minimum_present_minutes', 'minimum_half_day_minutes',
+            'late_threshold_minutes', 'early_checkout_threshold_minutes',
+            'auto_attendance', 'ot_enabled', 'ot_grace_minutes',
+            'allow_normal_punch', 'allow_gps', 'allow_geofencing', 'allow_qr',
+            'allow_face_recognition', 'allow_biometric',
+            'gps_latitude', 'gps_longitude', 'gps_radius_meters',
+            'location_required_checkin', 'location_required_checkout',
+            'extra_settings', 'created_at'
+        ]
+        read_only_fields = ['id', 'centre', 'created_at']
+

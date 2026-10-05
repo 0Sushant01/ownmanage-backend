@@ -3,7 +3,8 @@ from django.db import transaction
 from apps.accounts.models import User
 from apps.organization.models import (
     Business, BusinessMembership, BusinessRole,
-    Branch, Department, Employee, EmployeeAssignment
+    Branch, Department, Employee, EmployeeAssignment,
+    Designation, EmployeeDocument, Holiday, ManagerAccessControl, Permission
 )
 from apps.organization.services import generate_next_employee_id
 
@@ -161,15 +162,42 @@ class EmployeeListSerializer(serializers.ModelSerializer):
     department_name = serializers.CharField(source='department.name', read_only=True, default='')
     branch_name = serializers.CharField(source='branch.name', read_only=True, default='')
     manager_name = serializers.CharField(source='manager.full_name', read_only=True, default='')
+    designation_name = serializers.CharField(source='designation', read_only=True, default='')
+    current_salary = serializers.SerializerMethodField()
 
     class Meta:
         model = Employee
         fields = [
             'id', 'employee_id', 'first_name', 'last_name', 'full_name',
-            'email', 'phone', 'designation', 'employment_status',
+            'email', 'phone', 'designation', 'designation_name', 'employment_status',
             'joining_date', 'department_name', 'branch_name', 'manager_name',
-            'department', 'branch', 'manager'
+            'department', 'branch', 'manager', 'current_salary'
         ]
+
+    def get_current_salary(self, obj):
+        revs = getattr(obj, '_prefetched_salary_revisions', None)
+        if revs is not None:
+            latest = revs[0] if len(revs) > 0 else None
+        else:
+            latest = obj.salary_revisions.order_by('-effective_from').first()
+        if latest:
+            return f"{latest.currency} {latest.basic_salary:,.2f}"
+        return "—"
+
+
+class EmployeeActivityLogSerializer(serializers.ModelSerializer):
+    performed_by_name = serializers.CharField(source='performed_by.get_full_name', read_only=True)
+    employee_name = serializers.CharField(source='employee.full_name', read_only=True)
+
+    class Meta:
+        from apps.organization.models import EmployeeActivityLog
+        model = EmployeeActivityLog
+        fields = [
+            'id', 'business', 'employee', 'employee_name', 'activity_type',
+            'description', 'old_value', 'new_value', 'performed_by',
+            'performed_by_name', 'created_at'
+        ]
+        read_only_fields = ['id', 'business', 'employee', 'performed_by', 'created_at']
 
 
 class EmployeeDetailSerializer(serializers.ModelSerializer):
@@ -391,3 +419,48 @@ class BusinessCreateAdminSerializer(serializers.Serializer):
                 role=BusinessRole.BUSINESS_ADMIN
             )
             return membership
+
+
+class DesignationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Designation
+        fields = ['id', 'business', 'name', 'code', 'description', 'is_active', 'created_at']
+        read_only_fields = ['id', 'business', 'created_at']
+
+
+class EmployeeDocumentSerializer(serializers.ModelSerializer):
+    uploaded_by_name = serializers.CharField(source='uploaded_by.get_full_name', read_only=True)
+    verified_by_name = serializers.CharField(source='verified_by.get_full_name', read_only=True)
+    category_display = serializers.CharField(source='get_category_display', read_only=True)
+    verification_status_display = serializers.CharField(source='get_verification_status_display', read_only=True)
+
+    class Meta:
+        model = EmployeeDocument
+        fields = [
+            'id', 'business', 'employee', 'title', 'category', 'category_display',
+            'file_url', 'file_name', 'file_size_bytes', 'issue_date', 'expiry_date',
+            'verification_status', 'verification_status_display', 'verified_by', 'verified_by_name',
+            'verified_at', 'remarks', 'uploaded_by', 'uploaded_by_name', 'is_deleted', 'created_at'
+        ]
+        read_only_fields = ['id', 'business', 'employee', 'uploaded_by', 'verified_by', 'verified_at', 'created_at']
+
+
+class ManagerAccessControlSerializer(serializers.Serializer):
+    permission_key = serializers.CharField()
+    is_granted = serializers.BooleanField()
+    scope = serializers.CharField(required=False, default='CENTER')
+
+
+class HolidaySerializer(serializers.ModelSerializer):
+    centres_details = BranchSerializer(source='centres', many=True, read_only=True)
+    centre_ids = serializers.PrimaryKeyRelatedField(
+        many=True, queryset=Branch.objects.all(), source='centres', required=False
+    )
+
+    class Meta:
+        model = Holiday
+        fields = [
+            'id', 'business', 'name', 'holiday_date', 'description', 'is_optional',
+            'applies_to_all_centres', 'centre_ids', 'centres_details', 'created_at'
+        ]
+        read_only_fields = ['id', 'business', 'centres_details', 'created_at']

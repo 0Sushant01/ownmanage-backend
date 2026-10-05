@@ -1,4 +1,5 @@
 from datetime import date
+from django.utils import timezone
 from rest_framework import status, views, viewsets
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -154,24 +155,74 @@ class BusinessStatsView(views.APIView):
         if not biz:
             raise PermissionDenied('No business context available.')
 
-        today = date.today()
-        total_emp = Employee.objects.filter(business=biz, employment_status=EmploymentStatus.ACTIVE).count()
-        present_today = AttendanceDay.objects.filter(business=biz, attendance_date=today, status=AttendanceStatus.PRESENT).count()
-        on_leave = LeaveRequest.objects.filter(
+        import zoneinfo
+        tz_name = biz.timezone or 'Asia/Kolkata'
+        try:
+            biz_tz = zoneinfo.ZoneInfo(tz_name)
+        except Exception:
+            biz_tz = zoneinfo.ZoneInfo('Asia/Kolkata')
+
+        today = timezone.now().astimezone(biz_tz).date()
+
+        centre_id = request.query_params.get('centre_id') or request.query_params.get('branch_id')
+        centre_obj = None
+        if centre_id and centre_id not in ['all', 'ALL', 'null', '']:
+            centre_obj = Branch.objects.filter(id=centre_id, business=biz).first()
+
+        # Center Manager role lock
+        if ctx['role'] == BusinessRole.MANAGER and ctx.get('employee') and ctx['employee'].branch_id:
+            if not centre_obj:
+                centre_obj = ctx['employee'].branch
+                centre_id = str(centre_obj.id)
+
+        # Base querysets
+        centres_qs = Branch.objects.filter(business=biz)
+        emp_qs = Employee.objects.filter(business=biz)
+        att_qs = AttendanceDay.objects.filter(business=biz, attendance_date=today)
+        leave_qs = LeaveRequest.objects.filter(
             business=biz,
             status=LeaveRequestStatus.APPROVED,
             start_date__lte=today,
             end_date__gte=today
-        ).count()
-        absent_today = max(0, total_emp - (present_today + on_leave))
+        )
+
+        if centre_obj:
+            centres_qs = centres_qs.filter(id=centre_obj.id)
+            emp_qs = emp_qs.filter(branch=centre_obj)
+            att_qs = att_qs.filter(Q(centre=centre_obj) | Q(employee__branch=centre_obj))
+            leave_qs = leave_qs.filter(employee__branch=centre_obj)
+
+        total_centres = centres_qs.count()
+        active_centres = centres_qs.filter(is_active=True).count()
+
+        total_employees = emp_qs.count()
+        active_employees = emp_qs.filter(employment_status=EmploymentStatus.ACTIVE).count()
+
+        present_today = att_qs.filter(status__in=[AttendanceStatus.PRESENT, AttendanceStatus.OVERTIME]).count()
+        late_today = att_qs.filter(status=AttendanceStatus.LATE).count()
+        half_day_today = att_qs.filter(status=AttendanceStatus.HALF_DAY).count()
+        overtime_today = att_qs.filter(Q(status=AttendanceStatus.OVERTIME) | Q(overtime_seconds__gt=0)).count()
+        on_leave = leave_qs.count()
+
+        total_reported = present_today + late_today + half_day_today + on_leave
+        absent_today = max(0, active_employees - total_reported)
 
         return Response({
             'business_id': str(biz.id),
             'business_name': biz.name,
-            'total_employees': total_emp,
+            'selected_centre_id': str(centre_obj.id) if centre_obj else None,
+            'selected_centre_name': centre_obj.name if centre_obj else 'All Centres',
+            'date': str(today),
+            'total_centres': total_centres,
+            'active_centres': active_centres,
+            'total_employees': total_employees,
+            'active_employees': active_employees,
             'present_today': present_today,
-            'absent_today': absent_today,
+            'late_today': late_today,
+            'half_day_today': half_day_today,
+            'overtime_today': overtime_today,
             'on_leave': on_leave,
+            'absent_today': absent_today,
         })
 
 
@@ -208,6 +259,11 @@ class ManagerListView(views.APIView):
             user__business_memberships__is_active=True
         ).distinct() if biz else Employee.objects.none()
 
+        centre_id = request.query_params.get('centre_id') or request.query_params.get('branch_id')
+        if centre_id:
+            qs = qs.filter(branch_id=centre_id)
+
+        qs = qs.select_related('user', 'branch', 'department')
         return Response(EmployeeListSerializer(qs, many=True).data)
 
     def post(self, request):
@@ -270,9 +326,14 @@ class EmployeeListView(views.APIView):
         elif ctx['role'] == BusinessRole.BUSINESS_ADMIN:
             qs = Employee.objects.filter(business=biz)
         elif ctx['role'] == BusinessRole.MANAGER:
-            # Manager sees only their assigned direct reports
+            # Manager sees staff in their assigned Center or their direct reports
             if ctx.get('employee'):
-                qs = Employee.objects.filter(business=biz, manager=ctx['employee'])
+                mgr_emp = ctx['employee']
+                from django.db.models import Q
+                mgr_filter = Q(manager=mgr_emp)
+                if mgr_emp.branch_id:
+                    mgr_filter |= Q(branch_id=mgr_emp.branch_id)
+                qs = Employee.objects.filter(business=biz).filter(mgr_filter)
             else:
                 qs = Employee.objects.none()
         else:
@@ -282,18 +343,39 @@ class EmployeeListView(views.APIView):
             else:
                 qs = Employee.objects.none()
 
+        centre_filter = request.query_params.get('centre_id') or request.query_params.get('branch_id')
+        if centre_filter and centre_filter not in ['all', 'ALL', 'null', '']:
+            qs = qs.filter(branch_id=centre_filter)
+
+        dept_filter = request.query_params.get('department_id')
+        if dept_filter and dept_filter not in ['all', 'ALL', 'null', '']:
+            qs = qs.filter(department_id=dept_filter)
+
+        mgr_filter_param = request.query_params.get('manager_id')
+        if mgr_filter_param and mgr_filter_param not in ['all', 'ALL', 'null', '']:
+            qs = qs.filter(manager_id=mgr_filter_param)
+
         status_filter = request.query_params.get('status')
-        if status_filter:
+        if status_filter and status_filter not in ['all', 'ALL', 'null', '']:
             qs = qs.filter(employment_status=status_filter.upper())
 
-        qs = qs.select_related('department', 'branch', 'manager')
-        return Response(EmployeeListSerializer(qs.order_by('first_name'), many=True).data)
+        search_query = request.query_params.get('search')
+        if search_query:
+            qs = qs.filter(
+                Q(first_name__icontains=search_query) |
+                Q(last_name__icontains=search_query) |
+                Q(employee_id__icontains=search_query) |
+                Q(email__icontains=search_query)
+            )
+
+        from apps.payroll.models import SalaryRevision
+        qs = qs.select_related('department', 'branch', 'manager').prefetch_related(
+            Prefetch('salary_revisions', queryset=SalaryRevision.objects.order_by('-effective_from'), to_attr='_prefetched_salary_revisions')
+        )
+        return Response(EmployeeListSerializer(qs.order_by('first_name', 'last_name'), many=True).data)
 
     def post(self, request):
         ctx = get_user_context(request)
-        if not (ctx['is_superadmin'] or ctx['role'] == BusinessRole.BUSINESS_ADMIN):
-            raise PermissionDenied('Only Business Admin or SuperAdmin can create employees.')
-
         biz = ctx['business']
         if ctx['is_superadmin']:
             biz_id = request.data.get('business_id') or request.query_params.get('business_id')
@@ -303,9 +385,25 @@ class EmployeeListView(views.APIView):
         if not biz:
             raise PermissionDenied('A valid business is required to create an employee.')
 
+        from apps.organization.services.permission_service import PermissionService
+        if not PermissionService.has_permission(request.user, 'employees.create', business=biz):
+            raise PermissionDenied('You do not have permission to create employee records.')
+
         serializer = EmployeeCreateSerializer(data=request.data, context={'business': biz})
         serializer.is_valid(raise_exception=True)
         emp = serializer.save()
+
+        # Log employee creation timeline event
+        from apps.organization.models import EmployeeActivityLog
+        EmployeeActivityLog.objects.create(
+            business=biz,
+            employee=emp,
+            activity_type='EMPLOYEE_CREATED',
+            description=f"Employee profile created: {emp.full_name} ({emp.employee_id})",
+            new_value={'employee_id': emp.employee_id, 'branch': emp.branch.name if emp.branch else None},
+            performed_by=request.user
+        )
+
         return Response(EmployeeDetailSerializer(emp).data, status=status.HTTP_201_CREATED)
 
 
@@ -313,24 +411,15 @@ class EmployeeDetailView(views.APIView):
     permission_classes = [IsAuthenticated]
 
     def get_object(self, request, pk):
-        ctx = get_user_context(request)
-        emp = Employee.objects.filter(id=pk).first()
+        emp = Employee.objects.filter(id=pk).select_related('business').first()
         if not emp:
             raise NotFound('Employee not found.')
 
-        if ctx['is_superadmin']:
-            return emp
-        if emp.business_id != ctx['business'].id:
-            raise PermissionDenied('Cross-tenant access forbidden.')
-        if ctx['role'] == BusinessRole.BUSINESS_ADMIN:
-            return emp
-        if ctx['role'] == BusinessRole.MANAGER:
-            if ctx.get('employee') and (emp.manager_id == ctx['employee'].id or emp.id == ctx['employee'].id):
-                return emp
-            raise PermissionDenied('Manager cannot access staff not assigned to them.')
-        if ctx.get('employee') and emp.id == ctx['employee'].id:
-            return emp
-        raise PermissionDenied('Access denied.')
+        from apps.organization.services.permission_service import PermissionService
+        if not PermissionService.has_permission(request.user, 'employees.view', business=emp.business, target_employee=emp):
+            raise PermissionDenied('Access denied to employee record.')
+
+        return emp
 
     def get(self, request, pk):
         emp = self.get_object(request, pk)
@@ -338,26 +427,68 @@ class EmployeeDetailView(views.APIView):
 
     def patch(self, request, pk):
         emp = self.get_object(request, pk)
-        ctx = get_user_context(request)
-        if not (ctx['is_superadmin'] or ctx['role'] == BusinessRole.BUSINESS_ADMIN):
-            raise PermissionDenied('Only Business Admin can edit employee records.')
+        from apps.organization.services.permission_service import PermissionService
+        if not PermissionService.has_permission(request.user, 'employees.edit', business=emp.business, target_employee=emp):
+            raise PermissionDenied('You do not have permission to edit employee records.')
+
+        old_branch_name = emp.branch.name if emp.branch else 'None'
+        old_mgr_name = emp.manager.full_name if emp.manager else 'None'
+        old_status = emp.employment_status
 
         serializer = EmployeeDetailSerializer(emp, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return Response(EmployeeDetailSerializer(emp).data)
+        updated_emp = serializer.save()
+
+        from apps.organization.models import EmployeeActivityLog
+        if 'branch' in request.data and updated_emp.branch != emp.branch:
+            new_branch_name = updated_emp.branch.name if updated_emp.branch else 'None'
+            EmployeeActivityLog.objects.create(
+                business=emp.business,
+                employee=emp,
+                activity_type='CENTRE_CHANGED',
+                description=f"Centre changed: {old_branch_name} → {new_branch_name}",
+                old_value={'branch': old_branch_name},
+                new_value={'branch': new_branch_name},
+                performed_by=request.user
+            )
+
+        if 'manager' in request.data and updated_emp.manager != emp.manager:
+            new_mgr_name = updated_emp.manager.full_name if updated_emp.manager else 'None'
+            EmployeeActivityLog.objects.create(
+                business=emp.business,
+                employee=emp,
+                activity_type='MANAGER_CHANGED',
+                description=f"Manager changed: {old_mgr_name} → {new_mgr_name}",
+                old_value={'manager': old_mgr_name},
+                new_value={'manager': new_mgr_name},
+                performed_by=request.user
+            )
+
+        if 'employment_status' in request.data and updated_emp.employment_status != old_status:
+            EmployeeActivityLog.objects.create(
+                business=emp.business,
+                employee=emp,
+                activity_type='STATUS_CHANGED',
+                description=f"Status changed: {old_status} → {updated_emp.employment_status}",
+                old_value={'employment_status': old_status},
+                new_value={'employment_status': updated_emp.employment_status},
+                performed_by=request.user
+            )
+
+        return Response(EmployeeDetailSerializer(updated_emp).data)
 
 
 class EmployeeDeactivateView(views.APIView):
-    permission_classes = [IsBusinessAdmin]
+    permission_classes = [IsAuthenticated]
 
     def post(self, request, pk):
-        ctx = get_user_context(request)
-        emp = Employee.objects.filter(id=pk).first()
+        emp = Employee.objects.filter(id=pk).select_related('business').first()
         if not emp:
             raise NotFound('Employee not found.')
-        if not ctx['is_superadmin'] and emp.business_id != ctx['business'].id:
-            raise PermissionDenied('Cross-tenant operation forbidden.')
+
+        from apps.organization.services.permission_service import PermissionService
+        if not PermissionService.has_permission(request.user, 'employees.change_status', business=emp.business, target_employee=emp):
+            raise PermissionDenied('You do not have permission to change employee status.')
 
         emp.employment_status = EmploymentStatus.TERMINATED
         emp.date_of_exit = date.today()
@@ -520,4 +651,26 @@ class DepartmentListCreateView(views.APIView):
         serializer.is_valid(raise_exception=True)
         dept = serializer.save(business=biz)
         return Response(DepartmentSerializer(dept).data, status=status.HTTP_201_CREATED)
+
+
+class EmployeeActivityLogView(views.APIView):
+    """
+    Returns timeline activity log for an employee (who, what, when, old_value, new_value).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        emp = Employee.objects.filter(id=pk).select_related('business').first()
+        if not emp:
+            raise NotFound('Employee not found.')
+
+        ctx = get_user_context(request)
+        if not ctx['is_superadmin'] and emp.business_id != ctx['business'].id:
+            raise PermissionDenied('Cross-tenant employee access forbidden.')
+
+        from apps.organization.models import EmployeeActivityLog
+        from apps.organization.serializers import EmployeeActivityLogSerializer
+
+        logs = EmployeeActivityLog.objects.filter(employee=emp).select_related('performed_by').order_by('-created_at')
+        return Response(EmployeeActivityLogSerializer(logs[:100], many=True).data)
 

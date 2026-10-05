@@ -131,8 +131,11 @@ class AttendanceCheckInView(views.APIView):
             notes=request.data.get('notes', '')
         )
 
-        day.status = AttendanceStatus.PRESENT
-        day.save(update_fields=['status', 'updated_at'])
+        day.centre = emp.branch
+        day.save(update_fields=['centre', 'updated_at'])
+
+        from apps.attendance.services.attendance_calculation_service import AttendanceCalculationService
+        AttendanceCalculationService.calculate_daily_attendance(day, save=True)
 
         state = get_today_state(emp)
         return Response({
@@ -190,8 +193,12 @@ class AttendanceCheckOutView(views.APIView):
             notes=request.data.get('notes', '')
         )
 
+        day.centre = emp.branch
         day.total_work_seconds += session_duration
-        day.save(update_fields=['total_work_seconds', 'updated_at'])
+        day.save(update_fields=['centre', 'total_work_seconds', 'updated_at'])
+
+        from apps.attendance.services.attendance_calculation_service import AttendanceCalculationService
+        AttendanceCalculationService.calculate_daily_attendance(day, save=True)
 
         state = get_today_state(emp)
         return Response({
@@ -445,5 +452,250 @@ class AttendanceCorrectionRejectView(views.APIView):
         return Response({
             'detail': 'Attendance correction rejected.',
             'correction': AttendanceCorrectionSerializer(correction).data
+        })
+
+
+class AttendanceDailyRegisterView(views.APIView):
+    """
+    Roster-style attendance register for a specific date across all or selected Centres.
+    Lists ALL active employees. Employees with no punch records appear as NOT_MARKED,
+    WEEKLY_OFF, HOLIDAY, or ON_LEAVE according to resolved Centre policies and calendars.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from django.db.models import Q
+        from datetime import datetime
+        import zoneinfo
+
+        ctx = get_user_context(request)
+        biz = ctx['business']
+        centre_id = request.query_params.get('centre_id') or request.query_params.get('branch_id')
+
+        if ctx['is_superadmin']:
+            biz_id = request.query_params.get('business_id')
+            if biz_id:
+                from apps.organization.models import Business
+                biz = Business.objects.filter(id=biz_id).first() or biz
+            elif not biz and centre_id and centre_id not in ['all', 'ALL', 'null', '']:
+                from apps.organization.models import Branch
+                b = Branch.objects.filter(id=centre_id).first()
+                if b:
+                    biz = b.business
+            elif not biz:
+                from apps.organization.models import Business
+                biz = Business.objects.filter(is_active=True).first()
+
+        if not biz:
+            raise PermissionDenied('No active business/enterprise context found.')
+
+        # Resolve target date in enterprise/centre timezone
+        tz_name = biz.timezone or 'Asia/Kolkata'
+        try:
+            biz_tz = zoneinfo.ZoneInfo(tz_name)
+        except Exception:
+            biz_tz = zoneinfo.ZoneInfo('Asia/Kolkata')
+
+        date_param = request.query_params.get('date')
+        if date_param:
+            try:
+                target_date = datetime.strptime(date_param, '%Y-%m-%d').date()
+            except ValueError:
+                target_date = timezone.now().astimezone(biz_tz).date()
+        else:
+            target_date = timezone.now().astimezone(biz_tz).date()
+
+        # Query active employees
+        emp_qs = Employee.objects.filter(business=biz, employment_status='ACTIVE').select_related(
+            'branch', 'department', 'user', 'manager'
+        )
+
+        centre_id = request.query_params.get('centre_id') or request.query_params.get('branch_id')
+        if centre_id and centre_id not in ['all', 'ALL', 'null', '']:
+            emp_qs = emp_qs.filter(branch_id=centre_id)
+
+        # For Center Manager role, lock to their authorized center if not business admin
+        if ctx['role'] == BusinessRole.MANAGER and ctx.get('employee') and ctx['employee'].branch_id:
+            if not centre_id or centre_id in ['all', 'ALL']:
+                emp_qs = emp_qs.filter(branch_id=ctx['employee'].branch_id)
+
+        department_id = request.query_params.get('department_id')
+        if department_id and department_id not in ['all', 'ALL', 'null', '']:
+            emp_qs = emp_qs.filter(department_id=department_id)
+
+        search_query = request.query_params.get('search') or request.query_params.get('employee')
+        if search_query:
+            emp_qs = emp_qs.filter(
+                Q(first_name__icontains=search_query) |
+                Q(last_name__icontains=search_query) |
+                Q(employee_id__icontains=search_query) |
+                Q(email__icontains=search_query)
+            )
+
+        employees = list(emp_qs.order_by('first_name', 'last_name'))
+        if not employees:
+            return Response({
+                'date': str(target_date),
+                'summary': {
+                    'total_employees': 0, 'present': 0, 'late': 0, 'half_day': 0,
+                    'leave_early': 0, 'absent': 0, 'on_leave': 0, 'holiday': 0,
+                    'weekly_off': 0, 'not_marked': 0
+                },
+                'records': []
+            })
+
+        # Load holidays
+        from apps.organization.models import Holiday
+        from apps.leaves.models import LeaveRequest
+        from apps.organization.services.policy_resolver import PolicyResolver
+        from apps.attendance.services.attendance_calculation_service import AttendanceCalculationService
+
+        holidays = list(Holiday.objects.filter(business=biz, holiday_date=target_date).prefetch_related('centres'))
+
+        # Load approved leaves
+        leaves = LeaveRequest.objects.filter(
+            business=biz,
+            start_date__lte=target_date,
+            end_date__gte=target_date,
+            status='APPROVED',
+            employee__in=employees
+        ).select_related('leave_type')
+        leaves_by_emp = {str(l.employee_id): l for l in leaves}
+
+        # Load existing attendance days with events
+        att_days = AttendanceDay.objects.filter(
+            business=biz,
+            attendance_date=target_date,
+            employee__in=employees
+        ).prefetch_related('events')
+        days_by_emp = {str(d.employee_id): d for d in att_days}
+
+        policies_cache = {}
+        records = []
+        summary = {
+            'total_employees': len(employees),
+            'present': 0,
+            'late': 0,
+            'half_day': 0,
+            'leave_early': 0,
+            'absent': 0,
+            'on_leave': 0,
+            'holiday': 0,
+            'weekly_off': 0,
+            'not_marked': 0
+        }
+
+        weekday_idx = target_date.weekday()
+
+        for emp in employees:
+            centre = emp.branch
+            centre_key = str(centre.id) if centre else 'default'
+            if centre_key not in policies_cache:
+                policies_cache[centre_key] = PolicyResolver.get_attendance_policy(centre=centre, business=biz)['effective']
+            policy = policies_cache[centre_key]
+
+            # Employee timezone
+            emp_tz_name = (centre.timezone if centre and getattr(centre, 'timezone', None) else tz_name) or 'Asia/Kolkata'
+            try:
+                emp_tz = zoneinfo.ZoneInfo(emp_tz_name)
+            except Exception:
+                emp_tz = biz_tz
+
+            day = days_by_emp.get(str(emp.id))
+            events = list(day.events.order_by('event_time')) if day else []
+
+            if events:
+                calc = AttendanceCalculationService.calculate_daily_attendance(day, effective_policy=policy, save=False)
+                calc_status = calc['status']
+
+                first_in = next((e for e in events if e.event_type == AttendanceEventType.CHECK_IN), None)
+                last_out = next((e for e in reversed(events) if e.event_type == AttendanceEventType.CHECK_OUT), None)
+                check_in_str = first_in.event_time.astimezone(emp_tz).strftime('%I:%M %p') if first_in else '—'
+                check_out_str = last_out.event_time.astimezone(emp_tz).strftime('%I:%M %p') if last_out else '—'
+                work_sec = calc['total_work_seconds']
+                work_hrs_str = f"{work_sec // 3600:02d}h {(work_sec % 3600) // 60:02d}m"
+                late_m = calc['late_minutes']
+                early_m = calc['early_leave_minutes']
+                ot_s = calc['overtime_seconds']
+                final_status = calc_status
+            else:
+                check_in_str = '—'
+                check_out_str = '—'
+                work_hrs_str = '—'
+                late_m = 0
+                early_m = 0
+                ot_s = 0
+
+                # Check approved leave
+                if str(emp.id) in leaves_by_emp:
+                    final_status = 'ON_LEAVE'
+                else:
+                    # Check holiday
+                    is_holiday = any(h.applies_to_all_centres or (centre and h.centres.filter(id=centre.id).exists()) for h in holidays)
+                    if is_holiday:
+                        final_status = 'HOLIDAY'
+                    else:
+                        # Check weekly off days
+                        w_days = policy.get('weekly_off_days')
+                        if w_days is not None and isinstance(w_days, list):
+                            is_off = weekday_idx in [int(x) for x in w_days]
+                        else:
+                            is_off = (weekday_idx == int(policy.get('weekly_off', 6)))
+
+                        if is_off:
+                            final_status = 'WEEKLY_OFF'
+                        else:
+                            final_status = 'NOT_MARKED'
+
+            # Update summary counter
+            key_map = {
+                'PRESENT': 'present',
+                'LATE': 'late',
+                'HALF_DAY': 'half_day',
+                'LEAVE_EARLY': 'leave_early',
+                'OVERTIME': 'present',
+                'ABSENT': 'absent',
+                'ON_LEAVE': 'on_leave',
+                'HOLIDAY': 'holiday',
+                'WEEK_OFF': 'weekly_off',
+                'WEEKLY_OFF': 'weekly_off',
+                'NOT_MARKED': 'not_marked',
+            }
+            mapped_key = key_map.get(final_status, 'not_marked')
+            summary[mapped_key] = summary.get(mapped_key, 0) + 1
+
+            record = {
+                'id': str(day.id) if day else None,
+                'employee_id': str(emp.id),
+                'employee_code': emp.employee_id,
+                'employee_name': emp.full_name,
+                'department_name': emp.department.name if emp.department else '—',
+                'designation_name': emp.designation if emp.designation else '—',
+                'centre_id': str(centre.id) if centre else None,
+                'centre_name': centre.name if centre else '—',
+                'attendance_date': str(target_date),
+                'check_in': check_in_str,
+                'check_out': check_out_str,
+                'work_hours': work_hrs_str,
+                'status': 'WEEKLY_OFF' if final_status == 'WEEK_OFF' else final_status,
+                'late_minutes': late_m,
+                'early_leave_minutes': early_m,
+                'overtime_seconds': ot_s,
+                'events_count': len(events),
+            }
+            records.append(record)
+
+        # Optional status filtering
+        status_filter = request.query_params.get('status')
+        if status_filter and status_filter not in ['all', 'ALL', 'null', '']:
+            status_filter_upper = status_filter.upper()
+            if status_filter_upper == 'WEEK_OFF':
+                status_filter_upper = 'WEEKLY_OFF'
+            records = [r for r in records if r['status'] == status_filter_upper]
+
+        return Response({
+            'date': str(target_date),
+            'summary': summary,
+            'records': records
         })
 
