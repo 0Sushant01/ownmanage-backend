@@ -1,5 +1,5 @@
 from zoneinfo import ZoneInfo
-from datetime import date
+from datetime import date, timedelta
 from django.utils import timezone
 from rest_framework import status, views
 from rest_framework.response import Response
@@ -259,6 +259,10 @@ class AttendanceCalendarView(views.APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        import calendar as cal_mod
+        from apps.organization.models import Holiday, Branch
+        from apps.leaves.models import LeaveRequest
+
         ctx = get_user_context(request)
         emp = ctx.get('employee')
 
@@ -272,6 +276,7 @@ class AttendanceCalendarView(views.APIView):
         year = int(request.query_params.get('year', date.today().year))
         month = int(request.query_params.get('month', date.today().month))
 
+        # Get all AttendanceDay records for the month
         qs = AttendanceDay.objects.filter(
             employee=emp,
             attendance_date__year=year,
@@ -279,27 +284,162 @@ class AttendanceCalendarView(views.APIView):
         ).prefetch_related('events').order_by('attendance_date')
 
         tz = get_employee_timezone(emp)
-        calendar_data = []
+
+        # Build lookup from attendance records
+        attendance_map = {}
         for day in qs:
             events = list(day.events.order_by('event_time'))
             first_in = next((e for e in events if e.event_type == AttendanceEventType.CHECK_IN), None)
             last_out = next((e for e in reversed(events) if e.event_type == AttendanceEventType.CHECK_OUT), None)
+            verification = first_in.source if first_in else (last_out.source if last_out else 'WEB')
+            loc = 'Centre'
+            if first_in and first_in.latitude and first_in.longitude:
+                loc = f"{first_in.latitude:.3f}, {first_in.longitude:.3f}"
+            elif day.centre:
+                loc = day.centre.name
 
-            calendar_data.append({
-                'date': str(day.attendance_date),
+            attendance_map[day.attendance_date] = {
                 'status': day.status,
                 'total_work_seconds': day.total_work_seconds,
                 'work_hours': f"{day.total_work_seconds // 3600:02d}h {(day.total_work_seconds % 3600) // 60:02d}m",
+                'overtime_seconds': day.overtime_seconds,
+                'ot_hours': f"{day.overtime_seconds // 3600:02d}h {(day.overtime_seconds % 3600) // 60:02d}m",
                 'check_in': first_in.event_time.astimezone(tz).strftime('%I:%M %p') if first_in else None,
                 'check_out': last_out.event_time.astimezone(tz).strftime('%I:%M %p') if last_out else None,
-            })
+                'verification_method': verification,
+                'location': loc,
+                'correction': day.notes or 'None',
+            }
+
+        # Build holiday lookup for this month
+        biz = emp.business
+        holiday_qs = Holiday.objects.filter(
+            business=biz,
+            holiday_date__year=year,
+            holiday_date__month=month,
+        )
+        holiday_map = {}
+        for h in holiday_qs:
+            if h.applies_to_all_centres or (emp.branch and emp.branch in h.centres.all()):
+                holiday_map[h.holiday_date] = h.name
+
+        # Build approved leave lookup
+        first_day = date(year, month, 1)
+        last_day = date(year, month, cal_mod.monthrange(year, month)[1])
+        leave_qs = LeaveRequest.objects.filter(
+            employee=emp,
+            status='APPROVED',
+            start_date__lte=last_day,
+            end_date__gte=first_day,
+        ).select_related('leave_type')
+        leave_map = {}
+        for lr in leave_qs:
+            d = max(lr.start_date, first_day)
+            end = min(lr.end_date, last_day)
+            while d <= end:
+                leave_map[d] = lr.leave_type.name if lr.leave_type else 'Leave'
+                d += timedelta(days=1)
+
+        # Determine weekly off days from work schedule
+        week_off_days = set()  # 0=Mon..6=Sun
+        try:
+            from django.db.models import Q
+            from apps.attendance.models import EmployeeScheduleAssignment, WorkScheduleDay
+            assignment = EmployeeScheduleAssignment.objects.filter(
+                employee=emp,
+                effective_from__lte=last_day,
+            ).filter(
+                Q(effective_to__isnull=True) | Q(effective_to__gte=first_day)
+            ).select_related('schedule').order_by('-effective_from').first()
+            if assignment:
+                schedule_days = WorkScheduleDay.objects.filter(schedule=assignment.schedule)
+                for sd in schedule_days:
+                    if not sd.is_work_day:
+                        week_off_days.add(sd.day_of_week)
+        except Exception:
+            pass
+
+        today = date.today()
+        num_days = cal_mod.monthrange(year, month)[1]
+        calendar_data = []
+        for day_num in range(1, num_days + 1):
+            d = date(year, month, day_num)
+            if d in attendance_map:
+                entry = attendance_map[d]
+                calendar_data.append({
+                    'date': str(d),
+                    'day': day_num,
+                    'weekday': d.strftime('%a'),
+                    'status': entry['status'],
+                    'total_work_seconds': entry['total_work_seconds'],
+                    'work_hours': entry['work_hours'],
+                    'overtime_seconds': entry['overtime_seconds'],
+                    'ot_hours': entry['ot_hours'],
+                    'check_in': entry['check_in'],
+                    'check_out': entry['check_out'],
+                    'verification_method': entry.get('verification_method', 'WEB'),
+                    'location': entry.get('location', 'Centre'),
+                    'correction': entry.get('correction', 'None'),
+                    'holiday_name': holiday_map.get(d),
+                    'leave_type': leave_map.get(d),
+                })
+            else:
+                # Determine status for days without attendance records
+                if d in holiday_map:
+                    fill_status = 'HOLIDAY'
+                elif d.weekday() in week_off_days:
+                    fill_status = 'WEEK_OFF'
+                elif d in leave_map:
+                    fill_status = 'LEAVE'
+                elif d > today:
+                    fill_status = 'FUTURE'
+                elif d < today:
+                    fill_status = 'ABSENT'
+                else:
+                    fill_status = 'NOT_MARKED'
+
+                calendar_data.append({
+                    'date': str(d),
+                    'day': day_num,
+                    'weekday': d.strftime('%a'),
+                    'status': fill_status,
+                    'total_work_seconds': 0,
+                    'work_hours': '00h 00m',
+                    'overtime_seconds': 0,
+                    'ot_hours': '00h 00m',
+                    'check_in': None,
+                    'check_out': None,
+                    'verification_method': '—',
+                    'location': '—',
+                    'correction': 'None',
+                    'holiday_name': holiday_map.get(d),
+                    'leave_type': leave_map.get(d),
+                })
+
+        # Summary counts
+        total_ot_seconds = sum(day.overtime_seconds for day in qs)
+        summary = {
+            'present': sum(1 for d in calendar_data if d['status'] == 'PRESENT'),
+            'absent': sum(1 for d in calendar_data if d['status'] == 'ABSENT'),
+            'leave': sum(1 for d in calendar_data if d['status'] == 'LEAVE'),
+            'holiday': sum(1 for d in calendar_data if d['status'] == 'HOLIDAY'),
+            'week_off': sum(1 for d in calendar_data if d['status'] == 'WEEK_OFF'),
+            'weekly_off': sum(1 for d in calendar_data if d['status'] == 'WEEK_OFF'),
+            'half_day': sum(1 for d in calendar_data if d['status'] == 'HALF_DAY'),
+            'late': sum(1 for d in calendar_data if d['status'] in ('LATE', 'LEAVE_EARLY')),
+            'total_ot_seconds': total_ot_seconds,
+            'ot_hours': round(total_ot_seconds / 3600, 1),
+            'total_days': num_days,
+        }
 
         return Response({
             'employee_id': str(emp.id),
             'employee_name': emp.full_name,
             'year': year,
             'month': month,
+            'first_weekday': date(year, month, 1).weekday(),  # 0=Mon
             'days': calendar_data,
+            'summary': summary,
         })
 
 
@@ -479,7 +619,7 @@ class AttendanceDailyRegisterView(views.APIView):
                 biz = Business.objects.filter(id=biz_id).first() or biz
             elif not biz and centre_id and centre_id not in ['all', 'ALL', 'null', '']:
                 from apps.organization.models import Branch
-                b = Branch.objects.filter(id=centre_id).first()
+                b = Branch.resolve_branch(centre_id)
                 if b:
                     biz = b.business
             elif not biz:
@@ -512,7 +652,12 @@ class AttendanceDailyRegisterView(views.APIView):
 
         centre_id = request.query_params.get('centre_id') or request.query_params.get('branch_id')
         if centre_id and centre_id not in ['all', 'ALL', 'null', '']:
-            emp_qs = emp_qs.filter(branch_id=centre_id)
+            from apps.organization.models import Branch
+            branch_obj = Branch.resolve_branch(centre_id, business=biz)
+            if branch_obj:
+                emp_qs = emp_qs.filter(branch_id=branch_obj.id)
+            else:
+                emp_qs = emp_qs.none()
 
         # For Center Manager role, lock to their authorized center if not business admin
         if ctx['role'] == BusinessRole.MANAGER and ctx.get('employee') and ctx['employee'].branch_id:
@@ -551,6 +696,10 @@ class AttendanceDailyRegisterView(views.APIView):
         from apps.attendance.services.attendance_calculation_service import AttendanceCalculationService
 
         holidays = list(Holiday.objects.filter(business=biz, holiday_date=target_date).prefetch_related('centres'))
+        centre_holidays = [
+            (h.applies_to_all_centres, {str(c.id) for c in h.centres.all()})
+            for h in holidays
+        ]
 
         # Load approved leaves
         leaves = LeaveRequest.objects.filter(
@@ -631,7 +780,8 @@ class AttendanceDailyRegisterView(views.APIView):
                     final_status = 'ON_LEAVE'
                 else:
                     # Check holiday
-                    is_holiday = any(h.applies_to_all_centres or (centre and h.centres.filter(id=centre.id).exists()) for h in holidays)
+                    emp_centre_id = str(centre.id) if centre else None
+                    is_holiday = any(all_centres or (emp_centre_id in c_ids) for all_centres, c_ids in centre_holidays)
                     if is_holiday:
                         final_status = 'HOLIDAY'
                     else:

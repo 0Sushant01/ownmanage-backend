@@ -224,7 +224,7 @@ class CapacityReallocateView(views.APIView):
         if not centre_id or new_capacity is None:
             raise ValidationError({'detail': 'centre_id and allocated_capacity are required.'})
 
-        centre = Branch.objects.filter(id=centre_id).select_related('business').first()
+        centre = Branch.resolve_branch(centre_id)
         if not centre:
             raise NotFound('Centre not found.')
 

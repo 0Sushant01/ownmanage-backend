@@ -199,12 +199,41 @@ class EmployeeDocumentListCreateView(views.APIView):
         if not PermissionService.has_permission(request.user, 'documents.upload', business=emp.business, target_employee=emp):
             raise PermissionDenied('You do not have permission to upload documents for this employee.')
 
-        serializer = EmployeeDocumentSerializer(data=request.data)
+        data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+        uploaded_file = request.FILES.get('file')
+
+        if 'document_type' in data and 'category' not in data:
+            data['category'] = data['document_type']
+
+        if uploaded_file:
+            data['file_name'] = uploaded_file.name
+            data['file_size_bytes'] = uploaded_file.size
+            if not data.get('title'):
+                data['title'] = uploaded_file.name
+            if not data.get('file_url'):
+                data['file_url'] = f"/media/documents/{emp.id}/{uploaded_file.name}"
+        elif not data.get('file_url'):
+            data['file_url'] = f"/media/documents/{emp.id}/document.pdf"
+
+        if not data.get('title'):
+            data['title'] = data.get('file_name') or data.get('category') or 'Employee Document'
+
+        serializer = EmployeeDocumentSerializer(data=data)
         serializer.is_valid(raise_exception=True)
         doc = serializer.save(
             business=emp.business,
             employee=emp,
             uploaded_by=request.user
+        )
+
+        from apps.organization.models import EmployeeActivityLog
+        EmployeeActivityLog.objects.create(
+            business=emp.business,
+            employee=emp,
+            activity_type='DOCUMENT_UPLOADED',
+            description=f"Document uploaded: {doc.title} ({doc.get_category_display()})",
+            new_value={'title': doc.title, 'category': doc.category, 'file_name': doc.file_name},
+            performed_by=request.user
         )
 
         AuditService.log(
@@ -227,7 +256,6 @@ class EmployeeDocumentDetailView(views.APIView):
         if not doc:
             raise NotFound('Document not found.')
 
-        # Manager cannot delete unless Enterprise explicitly grants documents.delete
         if not PermissionService.has_permission(request.user, 'documents.delete', business=doc.business, target_employee=doc.employee):
             raise PermissionDenied('You do not have permission to delete employee documents.')
 
@@ -235,6 +263,16 @@ class EmployeeDocumentDetailView(views.APIView):
         doc.deleted_at = timezone.now()
         doc.deleted_by = request.user
         doc.save(update_fields=['is_deleted', 'deleted_at', 'deleted_by'])
+
+        from apps.organization.models import EmployeeActivityLog
+        EmployeeActivityLog.objects.create(
+            business=doc.business,
+            employee=doc.employee,
+            activity_type='DOCUMENT_DELETED',
+            description=f"Document deleted: {doc.title}",
+            old_value={'title': doc.title, 'category': doc.category},
+            performed_by=request.user
+        )
 
         AuditService.log(
             user_or_request=request,
@@ -282,10 +320,12 @@ class HolidayListCreateView(views.APIView):
 
         qs = Holiday.objects.filter(business=biz)
         centre_id = request.query_params.get('centre_id')
-        if centre_id:
+        if centre_id and centre_id not in ['all', 'ALL', 'null', '']:
             # Applies if applies_to_all_centres is True OR specific centre attached
-            from django.db.models import Q
-            qs = qs.filter(Q(applies_to_all_centres=True) | Q(centres__id=centre_id)).distinct()
+            branch_obj = Branch.resolve_branch(centre_id, business=biz)
+            if branch_obj:
+                from django.db.models import Q
+                qs = qs.filter(Q(applies_to_all_centres=True) | Q(centres__id=branch_obj.id)).distinct()
 
         year = request.query_params.get('year')
         if year:

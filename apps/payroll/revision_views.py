@@ -343,8 +343,12 @@ class PayrollRunListCreateView(views.APIView):
 
         qs = PayrollRun.objects.filter(business=biz)
         centre_id = request.query_params.get('centre_id')
-        if centre_id:
-            qs = qs.filter(centre_id=centre_id)
+        if centre_id and centre_id not in ['all', 'ALL', 'null', '']:
+            branch_obj = Branch.resolve_branch(centre_id, business=biz)
+            if branch_obj:
+                qs = qs.filter(centre_id=branch_obj.id)
+            else:
+                qs = qs.none()
 
         return Response(PayrollRunSerializer(qs.select_related('centre', 'approved_by')[:50], many=True).data)
 
@@ -374,8 +378,8 @@ class PayrollRunListCreateView(views.APIView):
 
         centre = None
         centre_id = request.data.get('centre_id')
-        if centre_id:
-            centre = Branch.objects.filter(id=centre_id, business=biz).first()
+        if centre_id and centre_id not in ['all', 'ALL', 'null', '']:
+            centre = Branch.resolve_branch(centre_id, business=biz)
 
         run = PayrollCalculationService.run_batch_payroll(
             business=biz,

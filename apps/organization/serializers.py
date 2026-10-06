@@ -211,6 +211,7 @@ class EmployeeDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'business', 'employee_id', 'first_name', 'last_name', 'full_name',
             'email', 'phone', 'designation', 'employment_status',
+            'date_of_birth', 'address', 'emergency_contact',
             'joining_date', 'date_of_exit',
             'department', 'branch', 'manager',
             'department_name', 'branch_name', 'manager_name',

@@ -14,14 +14,16 @@ class LeaveRequestSerializer(serializers.ModelSerializer):
     employee_id_code = serializers.CharField(source='employee.employee_id', read_only=True)
     leave_type_name = serializers.CharField(source='leave_type.name', read_only=True)
     leave_type_code = serializers.CharField(source='leave_type.code', read_only=True)
+    is_paid = serializers.BooleanField(source='leave_type.is_paid', read_only=True)
+    duration_display = serializers.CharField(source='get_duration_type_display', read_only=True)
     approved_by_name = serializers.CharField(source='approved_by.full_name', read_only=True, default='')
 
     class Meta:
         model = LeaveRequest
         fields = [
             'id', 'employee', 'employee_name', 'employee_id_code',
-            'leave_type', 'leave_type_name', 'leave_type_code',
-            'start_date', 'end_date', 'reason', 'status',
+            'leave_type', 'leave_type_name', 'leave_type_code', 'is_paid',
+            'start_date', 'end_date', 'duration_type', 'duration_display', 'reason', 'status',
             'approved_by', 'approved_by_name', 'approved_at',
             'rejected_at', 'rejection_reason', 'created_at'
         ]

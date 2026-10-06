@@ -33,6 +33,11 @@ class CompensationCalculationType(models.TextChoices):
     PERCENTAGE = 'PERCENTAGE', _('Percentage')
 
 
+class CompensationFrequency(models.TextChoices):
+    RECURRING = 'RECURRING', _('Recurring Monthly')
+    ONE_TIME = 'ONE_TIME', _('One-Time')
+
+
 class SalaryStructure(TimeStampedUUIDModel):
     """
     Historical salary definitions per employee.
@@ -441,6 +446,13 @@ class EmployeeCompensationItem(TimeStampedUUIDModel):
         default=CompensationCalculationType.FIXED_AMOUNT,
         verbose_name=_('Calculation Type')
     )
+    frequency = models.CharField(
+        max_length=20,
+        choices=CompensationFrequency.choices,
+        default=CompensationFrequency.RECURRING,
+        verbose_name=_('Payment Frequency'),
+        help_text=_('RECURRING components recur monthly. ONE_TIME components apply only to their specific effective period.')
+    )
     amount = models.DecimalField(
         max_digits=12,
         decimal_places=2,
@@ -476,3 +488,76 @@ class EmployeeCompensationItem(TimeStampedUUIDModel):
 
     def __str__(self):
         return f"{self.employee}: {self.name} ({self.component_type}) - {self.amount}"
+
+
+class PayrollLineItemType(models.TextChoices):
+    BASIC = 'BASIC', _('Base Salary')
+    EARNING = 'EARNING', _('Earning')
+    ALLOWANCE = 'ALLOWANCE', _('Allowance')
+    BONUS = 'BONUS', _('Bonus')
+    DEDUCTION = 'DEDUCTION', _('Deduction')
+    OVERTIME = 'OVERTIME', _('Overtime')
+    UNPAID_LEAVE = 'UNPAID_LEAVE', _('Unpaid Leave Deduction')
+    PENALTY = 'PENALTY', _('Penalty')
+    OTHER = 'OTHER', _('Other')
+
+
+class PayrollLineItem(TimeStampedUUIDModel):
+    """
+    Itemized, immutable calculation line for an employee's finalized payroll snapshot.
+    Guarantees historical payroll records can never be recalculated or altered by subsequent salary changes.
+    """
+    payroll = models.ForeignKey(
+        Payroll,
+        on_delete=models.CASCADE,
+        related_name='line_items',
+        verbose_name=_('Payroll Record')
+    )
+    name = models.CharField(max_length=150, verbose_name=_('Component Name'))
+    line_type = models.CharField(
+        max_length=30,
+        choices=PayrollLineItemType.choices,
+        default=PayrollLineItemType.EARNING,
+        verbose_name=_('Line Type')
+    )
+    amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        verbose_name=_('Amount')
+    )
+    rate = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=0.00,
+        verbose_name=_('Unit / Hourly Rate')
+    )
+    units = models.DecimalField(
+        max_digits=8,
+        decimal_places=2,
+        default=1.00,
+        verbose_name=_('Units / Hours / Days')
+    )
+    is_deduction = models.BooleanField(
+        default=False,
+        verbose_name=_('Is Deduction')
+    )
+    source_compensation_item = models.ForeignKey(
+        EmployeeCompensationItem,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='payroll_lines',
+        verbose_name=_('Source Compensation Item')
+    )
+
+    class Meta:
+        verbose_name = _('Payroll Line Item')
+        verbose_name_plural = _('Payroll Line Items')
+        ordering = ['is_deduction', 'name']
+        indexes = [
+            models.Index(fields=['payroll', 'is_deduction'], name='idx_payline_payroll_ded'),
+        ]
+
+    def __str__(self):
+        sign = '-' if self.is_deduction else '+'
+        return f"{self.payroll.employee}: {self.name} ({sign}{self.amount})"

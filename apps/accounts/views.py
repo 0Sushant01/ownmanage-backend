@@ -50,9 +50,20 @@ def build_user_payload(user, context=None):
             active_employee = {
                 'id': str(emp.id),
                 'employee_id': emp.employee_id,
+                'first_name': emp.first_name,
+                'last_name': emp.last_name,
+                'full_name': f"{emp.first_name} {emp.last_name}".strip(),
+                'email': emp.email,
+                'phone': emp.phone,
                 'designation': emp.designation,
+                'employment_status': getattr(emp, 'employment_status', 'ACTIVE'),
+                'joining_date': str(emp.joining_date) if emp.joining_date else None,
                 'department': emp.department.name if emp.department else None,
+                'department_name': emp.department.name if emp.department else None,
+                'department_id': str(emp.department.id) if emp.department else None,
                 'branch': emp.branch.name if emp.branch else None,
+                'branch_name': emp.branch.name if emp.branch else None,
+                'branch_id': str(emp.branch.id) if emp.branch else None,
             }
 
     from apps.organization.services.permission_service import PermissionService
@@ -126,13 +137,19 @@ class ProfileView(APIView):
                 'employee_id': e.employee_id,
                 'first_name': e.first_name,
                 'last_name': e.last_name,
+                'full_name': f"{e.first_name} {e.last_name}".strip(),
                 'email': e.email,
                 'phone': e.phone,
                 'designation': e.designation,
                 'joining_date': str(e.joining_date) if e.joining_date else None,
                 'status': getattr(e, 'employment_status', 'ACTIVE'),
+                'employment_status': getattr(e, 'employment_status', 'ACTIVE'),
                 'department': e.department.name if e.department else None,
+                'department_name': e.department.name if e.department else None,
+                'department_id': str(e.department.id) if e.department else None,
                 'branch': e.branch.name if e.branch else None,
+                'branch_name': e.branch.name if e.branch else None,
+                'branch_id': str(e.branch.id) if e.branch else None,
                 'manager': str(e.manager) if e.manager else None,
             }
 

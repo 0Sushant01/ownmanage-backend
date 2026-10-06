@@ -5,7 +5,9 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.payroll.models import (
-    Payroll, PayrollRun, PayrollRunStatus, PayrollStatus, SalaryRevision, SalaryStructure
+    Payroll, PayrollRun, PayrollRunStatus, PayrollStatus, SalaryRevision, SalaryStructure,
+    PayrollLineItem, PayrollLineItemType, EmployeeCompensationItem,
+    CompensationComponentType, CompensationCalculationType, CompensationFrequency
 )
 from apps.organization.models import Employee, Business, Branch
 from apps.attendance.models import AttendanceDay, AttendanceStatus
@@ -21,7 +23,9 @@ class PayrollCalculationService:
     ) -> Dict[str, Any]:
         """
         Calculates itemized remuneration for an employee over a specified pay period.
-        Formula: Base Salary + Allowances + Overtime - Unpaid Leaves - Deductions = Net Pay
+        Integrates normalized EmployeeCompensationItem records (one-time vs recurring),
+        evaluates attendance, and generates detailed line items.
+        Formula: Base Salary + Allowances + Bonuses + Overtime - Unpaid Leaves - Deductions = Net Pay
         """
         business = employee.business
 
@@ -35,18 +39,17 @@ class PayrollCalculationService:
         currency = 'INR'
         hourly_rate = Decimal('0.00')
         ot_rate = Decimal('0.00')
-        allowances = {}
-        deduction_rules = {}
+        legacy_allowances = {}
+        legacy_deductions = {}
 
         if revision:
             basic_salary = Decimal(str(revision.basic_salary))
             currency = revision.currency
             hourly_rate = Decimal(str(revision.hourly_rate))
             ot_rate = Decimal(str(revision.ot_rate))
-            allowances = revision.allowances or {}
-            deduction_rules = revision.deduction_rules or {}
+            legacy_allowances = revision.allowances or {}
+            legacy_deductions = revision.deduction_rules or {}
         else:
-            # Fallback to legacy SalaryStructure
             legacy = SalaryStructure.objects.filter(
                 employee=employee,
                 effective_from__lte=period_end
@@ -57,9 +60,9 @@ class PayrollCalculationService:
                 currency = legacy.currency
                 for comp in legacy.components.all():
                     if comp.component_type == 'EARNING':
-                        allowances[comp.name] = float(comp.amount)
+                        legacy_allowances[comp.name] = float(comp.amount)
                     else:
-                        deduction_rules[comp.name] = float(comp.amount)
+                        legacy_deductions[comp.name] = float(comp.amount)
 
         # 2. Compute attendance metrics for the period
         attendance_days = AttendanceDay.objects.filter(
@@ -75,7 +78,6 @@ class PayrollCalculationService:
         weekly_off_count = attendance_days.filter(status=AttendanceStatus.WEEK_OFF).count()
         holiday_count = attendance_days.filter(status=AttendanceStatus.HOLIDAY).count()
 
-        # Total ot seconds
         total_ot_seconds = sum(day.overtime_seconds for day in attendance_days)
         ot_hours = Decimal(str(round(total_ot_seconds / 3600.0, 2)))
 
@@ -91,7 +93,6 @@ class PayrollCalculationService:
         unpaid_leave_days = Decimal('0.0')
 
         for req in approved_leaves:
-            # Calculate overlapping days
             l_start = max(req.start_date, period_start)
             l_end = min(req.end_date, period_end)
             days_count = Decimal(str((l_end - l_start).days + 1))
@@ -105,16 +106,23 @@ class PayrollCalculationService:
 
         total_calendar_days = (period_end - period_start).days + 1
         effective_working_days = 30  # Standard payroll convention
-
-        # Calculate daily rate for unpaid deductions
         daily_rate = (basic_salary / Decimal(str(effective_working_days))) if effective_working_days > 0 else Decimal('0.00')
 
-        # Allowances total
-        total_allowances = Decimal('0.00')
-        for k, v in allowances.items():
-            total_allowances += Decimal(str(v))
+        # List of line items to build
+        line_items_data: List[Dict[str, Any]] = []
 
-        # Overtime pay
+        # Line Item: Base Salary
+        line_items_data.append({
+            'name': 'Base Salary',
+            'line_type': PayrollLineItemType.BASIC,
+            'amount': basic_salary,
+            'rate': daily_rate,
+            'units': Decimal(str(effective_working_days)),
+            'is_deduction': False,
+            'source_compensation_item': None,
+        })
+
+        # Overtime calculation
         if ot_rate > 0:
             ot_amount = ot_hours * ot_rate
         elif hourly_rate > 0:
@@ -122,14 +130,119 @@ class PayrollCalculationService:
         else:
             ot_amount = Decimal('0.00')
 
-        gross_amount = basic_salary + total_allowances + ot_amount
+        if ot_amount > Decimal('0.00'):
+            line_items_data.append({
+                'name': f'Overtime ({ot_hours} hrs)',
+                'line_type': PayrollLineItemType.OVERTIME,
+                'amount': ot_amount,
+                'rate': ot_rate if ot_rate > 0 else hourly_rate * Decimal('1.5'),
+                'units': ot_hours,
+                'is_deduction': False,
+                'source_compensation_item': None,
+            })
 
-        # Deductions
-        unpaid_deduction = unpaid_leave_days * daily_rate
-        total_deductions = unpaid_deduction
-        for k, v in deduction_rules.items():
-            total_deductions += Decimal(str(v))
+        # 4. Normalized EmployeeCompensationItem evaluation
+        # Fetch active components applicable to this period
+        comp_items = EmployeeCompensationItem.objects.filter(
+            employee=employee,
+            is_active=True,
+            effective_from__lte=period_end
+        )
 
+        total_comp_earnings = Decimal('0.00')
+        total_comp_deductions = Decimal('0.00')
+        evaluated_comp_ids = set()
+
+        for item in comp_items:
+            # Check effective_to date
+            if item.effective_to and item.effective_to < period_start:
+                continue
+
+            # ONE-TIME vs RECURRING check:
+            # ONE_TIME applies strictly if effective_from is within [period_start, period_end]
+            if item.frequency == CompensationFrequency.ONE_TIME:
+                if not (period_start <= item.effective_from <= period_end):
+                    continue
+
+            evaluated_comp_ids.add(item.id)
+
+            # Calculate amount
+            if item.calculation_type == CompensationCalculationType.PERCENTAGE:
+                comp_amt = (basic_salary * (item.amount / Decimal('100.0'))).quantize(Decimal('0.01'))
+            else:
+                comp_amt = item.amount
+
+            is_ded = (item.component_type == CompensationComponentType.DEDUCTION)
+
+            # Map line item type
+            type_map = {
+                CompensationComponentType.EARNING: PayrollLineItemType.EARNING,
+                CompensationComponentType.ALLOWANCE: PayrollLineItemType.ALLOWANCE,
+                CompensationComponentType.BONUS: PayrollLineItemType.BONUS,
+                CompensationComponentType.DEDUCTION: PayrollLineItemType.DEDUCTION,
+                CompensationComponentType.OVERTIME: PayrollLineItemType.OVERTIME,
+            }
+            mapped_line_type = type_map.get(item.component_type, PayrollLineItemType.OTHER)
+
+            line_items_data.append({
+                'name': item.name,
+                'line_type': mapped_line_type,
+                'amount': comp_amt,
+                'rate': comp_amt,
+                'units': Decimal('1.00'),
+                'is_deduction': is_ded,
+                'source_compensation_item': item,
+            })
+
+            if is_ded:
+                total_comp_deductions += comp_amt
+            else:
+                total_comp_earnings += comp_amt
+
+        # 5. Legacy JSON fallback for any rules not migrated to EmployeeCompensationItem
+        for k, v in legacy_allowances.items():
+            if not any(item['name'].lower() == k.lower() for item in line_items_data):
+                val = Decimal(str(v))
+                total_comp_earnings += val
+                line_items_data.append({
+                    'name': k,
+                    'line_type': PayrollLineItemType.ALLOWANCE,
+                    'amount': val,
+                    'rate': val,
+                    'units': Decimal('1.00'),
+                    'is_deduction': False,
+                    'source_compensation_item': None,
+                })
+
+        for k, v in legacy_deductions.items():
+            if not any(item['name'].lower() == k.lower() for item in line_items_data):
+                val = Decimal(str(v))
+                total_comp_deductions += val
+                line_items_data.append({
+                    'name': k,
+                    'line_type': PayrollLineItemType.DEDUCTION,
+                    'amount': val,
+                    'rate': val,
+                    'units': Decimal('1.00'),
+                    'is_deduction': True,
+                    'source_compensation_item': None,
+                })
+
+        # Unpaid Leave penalty
+        unpaid_deduction = (unpaid_leave_days * daily_rate).quantize(Decimal('0.01'))
+        if unpaid_deduction > Decimal('0.00'):
+            line_items_data.append({
+                'name': f'Unpaid Leave ({unpaid_leave_days} days)',
+                'line_type': PayrollLineItemType.UNPAID_LEAVE,
+                'amount': unpaid_deduction,
+                'rate': daily_rate,
+                'units': unpaid_leave_days,
+                'is_deduction': True,
+                'source_compensation_item': None,
+            })
+
+        gross_amount = basic_salary + total_comp_earnings + ot_amount
+        total_deductions = total_comp_deductions + unpaid_deduction
         net_amount = max(Decimal('0.00'), gross_amount - total_deductions)
 
         paid_days_effective = Decimal(str(present_count + weekly_off_count + holiday_count)) + (Decimal(str(half_day_count)) * Decimal('0.5')) + paid_leave_days
@@ -148,12 +261,13 @@ class PayrollCalculationService:
             'total_deductions': total_deductions,
             'net_amount': net_amount,
             'currency': currency,
+            'line_items': line_items_data,
             'salary_snapshot': {
                 'basic_salary': float(basic_salary),
-                'allowances': allowances,
-                'deduction_rules': deduction_rules,
                 'ot_amount': float(ot_amount),
                 'unpaid_deduction': float(unpaid_deduction),
+                'total_comp_earnings': float(total_comp_earnings),
+                'total_comp_deductions': float(total_comp_deductions),
             }
         }
 
@@ -168,7 +282,7 @@ class PayrollCalculationService:
     ) -> PayrollRun:
         """
         Executes a batch payroll run across all active employees in an enterprise or center.
-        Creates or updates items in a single atomic database transaction.
+        Creates both the summary Payroll record AND itemized PayrollLineItem rows in a single atomic transaction.
         """
         with transaction.atomic():
             run, _ = PayrollRun.objects.get_or_create(
@@ -199,7 +313,7 @@ class PayrollCalculationService:
             for emp in employees:
                 calc = cls.calculate_employee_payroll(emp, period_start, period_end)
 
-                Payroll.objects.update_or_create(
+                payroll, _ = Payroll.objects.update_or_create(
                     business=business,
                     employee=emp,
                     period_start=period_start,
@@ -220,6 +334,23 @@ class PayrollCalculationService:
                     }
                 )
 
+                # Materialize PayrollLineItem records
+                payroll.line_items.all().delete()
+                line_objs = [
+                    PayrollLineItem(
+                        payroll=payroll,
+                        name=line['name'],
+                        line_type=line['line_type'],
+                        amount=line['amount'],
+                        rate=line['rate'],
+                        units=line['units'],
+                        is_deduction=line['is_deduction'],
+                        source_compensation_item=line['source_compensation_item']
+                    )
+                    for line in calc['line_items']
+                ]
+                PayrollLineItem.objects.bulk_create(line_objs)
+
                 total_gross += calc['gross_amount']
                 total_deductions += calc['total_deductions']
                 total_net += calc['net_amount']
@@ -232,3 +363,4 @@ class PayrollCalculationService:
             run.save()
 
             return run
+

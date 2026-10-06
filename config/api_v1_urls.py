@@ -43,13 +43,17 @@ from apps.organization.access_views import (
     HolidayListCreateView, HolidayDetailView
 )
 from apps.attendance.policy_views import (
-    EnterpriseAttendancePolicyView, CentreAttendancePolicyView, CentreAttendancePolicyResetView
+    EnterpriseAttendancePolicyView, CentreAttendancePolicyView, CentreAttendancePolicyResetView,
+    EmployeeWorkingHoursView
 )
 from apps.payroll.revision_views import (
     EmployeeSalaryRevisionListCreateView, PayrollRunListCreateView,
     PayrollRunApproveView, PayrollRunFinalizeView,
     EmployeeSalaryComparisonView, EmployeeCompensationItemListCreateView,
     EmployeeCompensationItemDetailView
+)
+from apps.core.reports_views import (
+    AttendanceMonthlyReportView, PayrollRegisterReportView, CentreComparisonReportView
 )
 
 urlpatterns = [
@@ -132,6 +136,7 @@ urlpatterns = [
     path('employees/<uuid:pk>/salary-comparison/', EmployeeSalaryComparisonView.as_view(), name='api-employee-salary-comparison'),
     path('employees/<uuid:pk>/compensation-items/', EmployeeCompensationItemListCreateView.as_view(), name='api-employee-comp-items'),
     path('employees/<uuid:pk>/compensation-items/<uuid:comp_pk>/', EmployeeCompensationItemDetailView.as_view(), name='api-employee-comp-item-detail'),
+    path('employees/<uuid:pk>/working-hours/', EmployeeWorkingHoursView.as_view(), name='api-employee-working-hours'),
 
     # Documents
     path('documents/<uuid:pk>/', EmployeeDocumentDetailView.as_view(), name='api-document-detail'),
@@ -171,4 +176,9 @@ urlpatterns = [
     # Notifications
     path('notifications/', NotificationListView.as_view(), name='api-notifications'),
     path('notifications/<uuid:pk>/mark-read/', NotificationMarkReadView.as_view(), name='api-notification-mark-read'),
+
+    # Comprehensive Reports & Exports
+    path('attendance/reports/monthly/', AttendanceMonthlyReportView.as_view(), name='api-attendance-report-monthly'),
+    path('salary/reports/payroll-register/', PayrollRegisterReportView.as_view(), name='api-payroll-register-report'),
+    path('organization/reports/centre-comparison/', CentreComparisonReportView.as_view(), name='api-centre-comparison-report'),
 ]

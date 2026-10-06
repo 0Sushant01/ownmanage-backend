@@ -165,15 +165,15 @@ class BusinessStatsView(views.APIView):
         today = timezone.now().astimezone(biz_tz).date()
 
         centre_id = request.query_params.get('centre_id') or request.query_params.get('branch_id')
-        centre_obj = None
-        if centre_id and centre_id not in ['all', 'ALL', 'null', '']:
-            centre_obj = Branch.objects.filter(id=centre_id, business=biz).first()
+        centre_obj = Branch.resolve_branch(centre_id, business=biz)
+        if centre_obj:
+            centre_id = str(centre_obj.id)
 
         # Center Manager role lock
         if ctx['role'] == BusinessRole.MANAGER and ctx.get('employee') and ctx['employee'].branch_id:
             if not centre_obj:
                 centre_obj = ctx['employee'].branch
-                centre_id = str(centre_obj.id)
+                centre_id = str(centre_obj.id) if centre_obj else None
 
         # Base querysets
         centres_qs = Branch.objects.filter(business=biz)
@@ -260,8 +260,12 @@ class ManagerListView(views.APIView):
         ).distinct() if biz else Employee.objects.none()
 
         centre_id = request.query_params.get('centre_id') or request.query_params.get('branch_id')
-        if centre_id:
-            qs = qs.filter(branch_id=centre_id)
+        if centre_id and centre_id not in ['all', 'ALL', 'null', '']:
+            branch_obj = Branch.resolve_branch(centre_id, business=biz)
+            if branch_obj:
+                qs = qs.filter(branch_id=branch_obj.id)
+            else:
+                qs = qs.none()
 
         qs = qs.select_related('user', 'branch', 'department')
         return Response(EmployeeListSerializer(qs, many=True).data)
@@ -345,7 +349,11 @@ class EmployeeListView(views.APIView):
 
         centre_filter = request.query_params.get('centre_id') or request.query_params.get('branch_id')
         if centre_filter and centre_filter not in ['all', 'ALL', 'null', '']:
-            qs = qs.filter(branch_id=centre_filter)
+            branch_obj = Branch.resolve_branch(centre_filter, business=biz)
+            if branch_obj:
+                qs = qs.filter(branch_id=branch_obj.id)
+            else:
+                qs = qs.none()
 
         dept_filter = request.query_params.get('department_id')
         if dept_filter and dept_filter not in ['all', 'ALL', 'null', '']:
@@ -472,6 +480,18 @@ class EmployeeDetailView(views.APIView):
                 description=f"Status changed: {old_status} → {updated_emp.employment_status}",
                 old_value={'employment_status': old_status},
                 new_value={'employment_status': updated_emp.employment_status},
+                performed_by=request.user
+            )
+
+        profile_fields = ['first_name', 'last_name', 'email', 'phone', 'date_of_birth', 'address', 'emergency_contact', 'designation', 'department']
+        changed_fields = [f for f in profile_fields if f in request.data]
+        if changed_fields:
+            EmployeeActivityLog.objects.create(
+                business=emp.business,
+                employee=emp,
+                activity_type='PROFILE_UPDATED',
+                description=f"Profile details updated ({', '.join(changed_fields)})",
+                new_value={f: str(getattr(updated_emp, f, '')) for f in changed_fields},
                 performed_by=request.user
             )
 

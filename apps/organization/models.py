@@ -202,6 +202,29 @@ class Branch(TimeStampedUUIDModel):
     def active_employees_count(self) -> int:
         return self.employees.filter(employment_status='ACTIVE').count()
 
+    @classmethod
+    def resolve_branch(cls, val, business=None):
+        """
+        Resolves a branch/centre by UUID string, UUID object, or name/code.
+        Returns the Branch instance or None if not found/unspecified.
+        Guarantees no unhandled ValidationError when an arbitrary string is passed.
+        """
+        if not val or str(val).strip().lower() in ['all', 'none', 'null', '']:
+            return None
+        import uuid
+        val_str = str(val).strip()
+        try:
+            uuid_obj = uuid.UUID(val_str)
+            qs = cls.objects.filter(id=uuid_obj)
+            if business:
+                qs = qs.filter(business=business)
+            return qs.first()
+        except (ValueError, AttributeError):
+            qs = cls.objects.all()
+            if business:
+                qs = qs.filter(business=business)
+            return qs.filter(models.Q(name__iexact=val_str) | models.Q(code__iexact=val_str)).first()
+
 
 # Centre is the canonical operational name for a work location / branch
 Centre = Branch
@@ -276,6 +299,9 @@ class Employee(TimeStampedUUIDModel):
     last_name = models.CharField(max_length=150, blank=True, verbose_name=_('Last Name'))
     email = models.EmailField(blank=True, verbose_name=_('Work Email'))
     phone = models.CharField(max_length=30, blank=True, verbose_name=_('Phone Number'))
+    date_of_birth = models.DateField(null=True, blank=True, verbose_name=_('Date of Birth'))
+    address = models.TextField(blank=True, verbose_name=_('Address'))
+    emergency_contact = models.CharField(max_length=100, blank=True, verbose_name=_('Emergency Contact'))
 
     branch = models.ForeignKey(
         Branch,
@@ -703,6 +729,25 @@ class EmployeeActivityLog(TimeStampedUUIDModel):
             models.Index(fields=['employee', '-created_at'], name='idx_emp_act_created'),
             models.Index(fields=['business', '-created_at'], name='idx_biz_act_created'),
         ]
+
+    def __init__(self, *args, **kwargs):
+        if 'activity_type' in kwargs and 'action_type' not in kwargs:
+            kwargs['action_type'] = kwargs.pop('activity_type')
+        if 'performed_by' in kwargs and 'actor' not in kwargs:
+            kwargs['actor'] = kwargs.pop('performed_by')
+        if 'new_value' in kwargs and not isinstance(kwargs['new_value'], str):
+            import json
+            try:
+                kwargs['new_value'] = json.dumps(kwargs['new_value'])
+            except Exception:
+                kwargs['new_value'] = str(kwargs['new_value'])
+        if 'old_value' in kwargs and not isinstance(kwargs['old_value'], str):
+            import json
+            try:
+                kwargs['old_value'] = json.dumps(kwargs['old_value'])
+            except Exception:
+                kwargs['old_value'] = str(kwargs['old_value'])
+        super().__init__(*args, **kwargs)
 
     def __str__(self):
         return f"{self.employee.full_name}: {self.action_type} at {self.created_at}"

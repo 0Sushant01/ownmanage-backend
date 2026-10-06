@@ -165,3 +165,92 @@ class CentreAttendancePolicyResetView(views.APIView):
             'detail': msg,
             **policy_data
         })
+
+
+class EmployeeWorkingHoursView(views.APIView):
+    """
+    Returns effective working hours and schedule configuration for an employee,
+    with explicit configuration provenance (Enterprise Default vs Centre Override vs Employee Specific).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        from apps.organization.models import Employee
+        emp = Employee.objects.filter(id=pk).select_related('business', 'branch').first()
+        if not emp:
+            raise NotFound('Employee not found.')
+
+        ctx = get_user_context(request)
+        if not ctx['is_superadmin'] and emp.business_id != ctx['business'].id:
+            raise PermissionDenied('Cross-tenant access forbidden.')
+
+        centre = emp.branch
+        biz = emp.business
+        policy_data = PolicyResolver.get_attendance_policy(centre=centre, business=biz, user=request.user)
+
+        # Check if employee has a specific schedule assignment
+        from apps.attendance.models import EmployeeScheduleAssignment
+        assignment = EmployeeScheduleAssignment.objects.filter(
+            employee=emp,
+            effective_to__isnull=True
+        ).select_related('schedule').order_by('-effective_from').first()
+
+        effective = policy_data.get('effective', {})
+        source_dict = policy_data.get('source', {})
+
+        # Determine overall configuration source
+        has_centre_override = centre and any(src == 'center' for src in source_dict.values())
+        if assignment:
+            config_source = 'Employee Custom Schedule'
+            source_badge = 'Employee Specific'
+        elif has_centre_override:
+            config_source = f"Centre Policy ({centre.name})"
+            source_badge = 'Inherited from Centre'
+        elif centre:
+            config_source = f"Enterprise Default (inherited by {centre.name})"
+            source_badge = 'Inherited from Enterprise'
+        else:
+            config_source = "Enterprise Default Policy"
+            source_badge = 'Inherited from Enterprise'
+
+        # Map day numbers to names
+        day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        weekly_off_days_indices = effective.get('weekly_off_days') or [6]
+        weekly_off_names = [day_names[i] for i in weekly_off_days_indices if 0 <= i < 7]
+
+        return Response({
+            'employee_id': str(emp.id),
+            'employee_name': emp.full_name,
+            'centre_id': str(centre.id) if centre else None,
+            'centre_name': centre.name if centre else 'Unassigned Centre',
+            'configuration_source': config_source,
+            'source_badge': source_badge,
+            'shift_timings': {
+                'office_start': effective.get('office_start', '09:00'),
+                'office_end': effective.get('office_end', '18:00'),
+                'break_start': effective.get('break_start', '13:00'),
+                'break_end': effective.get('break_end', '14:00'),
+            },
+            'rules': {
+                'grace_period_minutes': effective.get('grace_period_minutes', 15),
+                'minimum_present_minutes': effective.get('minimum_present_minutes', 480),
+                'minimum_half_day_minutes': effective.get('minimum_half_day_minutes', 240),
+                'late_threshold_minutes': effective.get('late_threshold_minutes', 30),
+                'early_checkout_threshold_minutes': effective.get('early_checkout_threshold_minutes', 30),
+                'working_days_per_week': effective.get('working_days', 5),
+                'weekly_off_days': weekly_off_names,
+                'ot_enabled': effective.get('ot_enabled', False),
+                'ot_grace_minutes': effective.get('ot_grace_minutes', 30),
+                'max_daily_ot_minutes': effective.get('max_daily_ot_minutes', 240),
+            },
+            'verification_methods': {
+                'normal_punch': effective.get('allow_normal_punch', True),
+                'gps': effective.get('allow_gps', True),
+                'geofencing': effective.get('allow_geofencing', False),
+                'qr': effective.get('allow_qr', False),
+                'face_recognition': effective.get('allow_face_recognition', False),
+                'biometric': effective.get('allow_biometric', False),
+            },
+            'effective': effective,
+            'source': source_dict
+        })

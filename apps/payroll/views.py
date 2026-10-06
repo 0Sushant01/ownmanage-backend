@@ -47,7 +47,12 @@ class PayrollListView(views.APIView):
 
         centre_filter = request.query_params.get('centre_id') or request.query_params.get('branch_id')
         if centre_filter and centre_filter not in ['all', 'ALL', 'null', '']:
-            qs = qs.filter(employee__branch_id=centre_filter)
+            from apps.organization.models import Branch
+            branch_obj = Branch.resolve_branch(centre_filter, business=ctx.get('business'))
+            if branch_obj:
+                qs = qs.filter(employee__branch_id=branch_obj.id)
+            else:
+                qs = qs.none()
 
         period_start = request.query_params.get('period_start')
         if period_start:
