@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
@@ -7,7 +7,7 @@ from apps.organization.models import Business, Branch
 from apps.subscriptions.models import (
     Plan, Subscription, SubscriptionHistory,
     CentreCapacityAllocation, Commission, Broker, Referral,
-    SubscriptionAction
+    SubscriptionAction, SubscriptionPayment, PaymentStatus
 )
 
 
@@ -58,6 +58,7 @@ def change_subscription_plan(business: Business, new_plan: Plan, reason: str = "
     Upgrades or downgrades an enterprise's subscription plan.
     Never destructively removes employees or centres.
     Records historical subscription snapshot for audit and billing provenance.
+    Activates expired/inactive subscriptions and registers verified payment provenance.
     """
     with transaction.atomic():
         biz = Business.objects.select_for_update().get(id=business.id)
@@ -81,6 +82,7 @@ def change_subscription_plan(business: Business, new_plan: Plan, reason: str = "
                 action = SubscriptionAction.RENEWAL
 
         today = date.today()
+        new_period_end = today + timedelta(days=30)
 
         # Record historical snapshot
         SubscriptionHistory.objects.create(
@@ -96,15 +98,77 @@ def change_subscription_plan(business: Business, new_plan: Plan, reason: str = "
 
         if sub:
             sub.plan = new_plan
-            sub.save(update_fields=['plan', 'updated_at'])
+            # If expired, trial, pending, or past due, reactivate and extend period
+            if sub.status in ['EXPIRED', 'TRIAL', 'PENDING', 'CANCELLED'] or sub.current_period_end < today:
+                sub.status = 'ACTIVE'
+                sub.current_period_start = today
+                sub.current_period_end = new_period_end
+            sub.save()
         else:
             sub = Subscription.objects.create(
                 business=biz,
                 plan=new_plan,
                 start_date=today,
+                status='ACTIVE',
                 current_period_start=today,
-                current_period_end=today,
+                current_period_end=new_period_end,
             )
+
+        # Record payment record as PAID for the newly activated billing period
+        SubscriptionPayment.objects.create(
+            subscription=sub,
+            business=biz,
+            plan=new_plan,
+            amount=new_plan.monthly_charge,
+            billing_date=today,
+            due_date=today + timedelta(days=7),
+            status=PaymentStatus.PAID,
+            payment_reference=f"ADMIN-{action}-{today.strftime('%Y%m%d')}",
+            notes=reason or f"SuperAdmin plan assignment/renewal to {new_plan.name}"
+        )
+
+        return sub
+
+
+def renew_subscription(business: Business, reason: str = "") -> Subscription:
+    """
+    Extends subscription by 30 days and marks payment paid for the new period.
+    """
+    with transaction.atomic():
+        biz = Business.objects.select_for_update().get(id=business.id)
+        sub = Subscription.objects.select_for_update().filter(business=biz).first()
+        if not sub:
+            raise ValidationError({'detail': 'No subscription exists to renew.'})
+
+        today = date.today()
+        new_period_end = max(today, sub.current_period_end or today) + timedelta(days=30)
+        sub.status = 'ACTIVE'
+        sub.current_period_start = today
+        sub.current_period_end = new_period_end
+        sub.save()
+
+        SubscriptionHistory.objects.create(
+            business=biz,
+            plan=sub.plan,
+            action=SubscriptionAction.RENEWAL,
+            monthly_charge=sub.plan.monthly_charge,
+            max_centres=sub.plan.max_centres,
+            total_employee_capacity=sub.plan.total_employee_capacity,
+            effective_from=today,
+            reason=reason or f"Administrative renewal for {sub.plan.name}"
+        )
+
+        SubscriptionPayment.objects.create(
+            subscription=sub,
+            business=biz,
+            plan=sub.plan,
+            amount=sub.plan.monthly_charge,
+            billing_date=today,
+            due_date=today + timedelta(days=7),
+            status=PaymentStatus.PAID,
+            payment_reference=f"RENEW-{today.strftime('%Y%m%d')}",
+            notes=reason or "Subscription administrative renewal (+30 days)"
+        )
 
         return sub
 

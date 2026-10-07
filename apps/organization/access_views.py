@@ -1,3 +1,8 @@
+import os
+import mimetypes
+from pathlib import Path
+from django.conf import settings
+from django.http import FileResponse
 from django.utils import timezone
 from rest_framework import views, status
 from rest_framework.response import Response
@@ -52,6 +57,14 @@ class ManagerAccessControlView(views.APIView):
 
         biz = ctx['business']
         manager_user = User.objects.filter(id=pk).first()
+        manager_emp = None
+        if not manager_user:
+            manager_emp = Employee.objects.filter(id=pk).select_related('user', 'branch').first()
+            if manager_emp and manager_emp.user:
+                manager_user = manager_emp.user
+        else:
+            manager_emp = Employee.objects.filter(user=manager_user, business=biz).select_related('branch').first()
+
         if not manager_user:
             raise NotFound('Manager not found.')
 
@@ -63,29 +76,66 @@ class ManagerAccessControlView(views.APIView):
                 is_active=True
             ).exists()
             if not is_member:
-                raise PermissionDenied('User is not an active manager in this business.')
+                # Also allow if employee belongs to this business and has manager role/designation
+                is_mgr = manager_user.business_memberships.filter(
+                    business=biz,
+                    is_active=True
+                ).exists() and Employee.objects.filter(
+                    user=manager_user,
+                    business=biz,
+                    designation__icontains='Manager'
+                ).exists()
+                if not is_mgr:
+                    raise PermissionDenied('User is not an active manager in this business.')
 
-        return biz, manager_user
+        return biz, manager_user, manager_emp
 
     def get(self, request, pk):
-        biz, manager_user = self.get_manager_user(request, pk)
+        biz, manager_user, manager_emp = self.get_manager_user(request, pk)
         matrix = PermissionService.get_manager_access_matrix(business=biz, manager_user=manager_user)
+
+        modules = {}
+        granted_count = 0
+        for item in matrix:
+            mod_key = item.get('module', 'general')
+            if mod_key not in modules:
+                modules[mod_key] = {
+                    'module_display': mod_key.replace('_', ' ').title(),
+                    'permissions': []
+                }
+            if item.get('is_granted'):
+                granted_count += 1
+            modules[mod_key]['permissions'].append(item)
+
+        branch_name = 'All Centers'
+        if manager_emp and manager_emp.branch:
+            branch_name = manager_emp.branch.name
+
         return Response({
             'manager_id': str(manager_user.id),
             'manager_name': manager_user.get_full_name(),
             'manager_email': manager_user.email,
-            'permissions': matrix
+            'permissions': matrix,
+            'manager': {
+                'id': str(manager_emp.id) if manager_emp else str(manager_user.id),
+                'name': manager_user.get_full_name(),
+                'email': manager_user.email,
+                'branch_name': branch_name,
+            },
+            'granted_count': granted_count,
+            'total_permissions': len(matrix),
+            'modules': modules
         })
 
     def put(self, request, pk):
-        biz, manager_user = self.get_manager_user(request, pk)
+        biz, manager_user, manager_emp = self.get_manager_user(request, pk)
         permissions_data = request.data.get('permissions', [])
         if not isinstance(permissions_data, list):
             raise ValidationError({'detail': 'Expected a list of permissions to configure.'})
 
         updated = []
         for item in permissions_data:
-            key = item.get('key')
+            key = item.get('key') or item.get('permission_key')
             is_granted = item.get('is_granted')
             scope = item.get('scope', 'CENTER')
             if key and is_granted is not None:
@@ -110,9 +160,35 @@ class ManagerAccessControlView(views.APIView):
         )
 
         matrix = PermissionService.get_manager_access_matrix(business=biz, manager_user=manager_user)
+        modules = {}
+        granted_count = 0
+        for item in matrix:
+            mod_key = item.get('module', 'general')
+            if mod_key not in modules:
+                modules[mod_key] = {
+                    'module_display': mod_key.replace('_', ' ').title(),
+                    'permissions': []
+                }
+            if item.get('is_granted'):
+                granted_count += 1
+            modules[mod_key]['permissions'].append(item)
+
+        branch_name = 'All Centers'
+        if manager_emp and manager_emp.branch:
+            branch_name = manager_emp.branch.name
+
         return Response({
             'detail': f'Updated {len(updated)} permissions for {manager_user.get_full_name()}.',
-            'permissions': matrix
+            'permissions': matrix,
+            'manager': {
+                'id': str(manager_emp.id) if manager_emp else str(manager_user.id),
+                'name': manager_user.get_full_name(),
+                'email': manager_user.email,
+                'branch_name': branch_name,
+            },
+            'granted_count': granted_count,
+            'total_permissions': len(matrix),
+            'modules': modules
         })
 
 
@@ -205,18 +281,48 @@ class EmployeeDocumentListCreateView(views.APIView):
         if 'document_type' in data and 'category' not in data:
             data['category'] = data['document_type']
 
+        doc_dir = Path(getattr(settings, 'DOCUMENTS_STORAGE_DIR', '/home/s/projects/ownmanage/document'))
+        doc_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_filename = None
         if uploaded_file:
-            data['file_name'] = uploaded_file.name
+            orig_name = uploaded_file.name
+            safe_filename = orig_name
+            target_path = doc_dir / safe_filename
+            if target_path.exists():
+                stem, ext = os.path.splitext(orig_name)
+                safe_filename = f"{stem}_{emp.employee_id or str(emp.id)[:8]}{ext}"
+                target_path = doc_dir / safe_filename
+                if target_path.exists():
+                    safe_filename = f"{stem}_{int(timezone.now().timestamp())}{ext}"
+                    target_path = doc_dir / safe_filename
+
+            with open(target_path, 'wb+') as dest:
+                for chunk in uploaded_file.chunks():
+                    dest.write(chunk)
+
+            data['file_name'] = safe_filename
             data['file_size_bytes'] = uploaded_file.size
             if not data.get('title'):
-                data['title'] = uploaded_file.name
-            if not data.get('file_url'):
-                data['file_url'] = f"/media/documents/{emp.id}/{uploaded_file.name}"
-        elif not data.get('file_url'):
-            data['file_url'] = f"/media/documents/{emp.id}/document.pdf"
+                data['title'] = orig_name
+        elif data.get('existing_file_name'):
+            safe_filename = os.path.basename(data['existing_file_name'])
+            target_path = doc_dir / safe_filename
+            if target_path.exists():
+                data['file_name'] = safe_filename
+                data['file_size_bytes'] = target_path.stat().st_size
+                if not data.get('title'):
+                    data['title'] = safe_filename
+
+        if not safe_filename:
+            safe_filename = data.get('file_name') or 'document.pdf'
+            data['file_name'] = safe_filename
 
         if not data.get('title'):
             data['title'] = data.get('file_name') or data.get('category') or 'Employee Document'
+
+        if not data.get('file_url'):
+            data['file_url'] = f"/api/v1/documents/file/{safe_filename}"
 
         serializer = EmployeeDocumentSerializer(data=data)
         serializer.is_valid(raise_exception=True)
@@ -225,6 +331,10 @@ class EmployeeDocumentListCreateView(views.APIView):
             employee=emp,
             uploaded_by=request.user
         )
+
+        # Direct download endpoint for this document
+        doc.file_url = f"/api/v1/documents/{doc.id}/download/"
+        doc.save(update_fields=['file_url'])
 
         from apps.organization.models import EmployeeActivityLog
         EmployeeActivityLog.objects.create(
@@ -307,6 +417,67 @@ class EmployeeDocumentVerifyView(views.APIView):
         doc.save(update_fields=['verification_status', 'verified_by', 'verified_at', 'remarks', 'updated_at'])
 
         return Response(EmployeeDocumentSerializer(doc).data)
+
+
+class EmployeeDocumentDownloadView(views.APIView):
+    """
+    Downloads or streams the physical document file stored in /home/s/projects/ownmanage/document.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        doc = EmployeeDocument.objects.filter(id=pk, is_deleted=False).select_related('employee', 'business').first()
+        if not doc:
+            raise NotFound('Document not found.')
+
+        if not PermissionService.has_permission(request.user, 'documents.view', business=doc.business, target_employee=doc.employee):
+            raise PermissionDenied('You do not have permission to access this document.')
+
+        doc_dir = Path(getattr(settings, 'DOCUMENTS_STORAGE_DIR', '/home/s/projects/ownmanage/document'))
+        file_path = None
+        candidates = [
+            doc_dir / doc.file_name,
+            doc_dir / str(doc.employee.id) / doc.file_name,
+            doc_dir / f"{doc.employee.employee_id}_{doc.file_name}",
+        ]
+        for c in candidates:
+            if c.exists():
+                file_path = c
+                break
+
+        if not file_path or not file_path.exists():
+            raise NotFound('Physical document file not found in document directory.')
+
+        content_type, _ = mimetypes.guess_type(str(file_path))
+        content_type = content_type or 'application/octet-stream'
+
+        is_inline = request.query_params.get('inline', '0') in ['1', 'true', 'True']
+        disposition = 'inline' if is_inline else 'attachment'
+
+        response = FileResponse(open(file_path, 'rb'), content_type=content_type)
+        response['Content-Disposition'] = f'{disposition}; filename="{doc.file_name}"'
+        return response
+
+
+class AvailableDocumentFilesView(views.APIView):
+    """
+    Lists physical files in /home/s/projects/ownmanage/document for assignment or inspection.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        doc_dir = Path(getattr(settings, 'DOCUMENTS_STORAGE_DIR', '/home/s/projects/ownmanage/document'))
+        if not doc_dir.exists():
+            return Response([])
+        files = []
+        for f in sorted(doc_dir.iterdir(), key=lambda x: x.name):
+            if f.is_file():
+                files.append({
+                    'name': f.name,
+                    'size_bytes': f.stat().st_size,
+                    'modified_at': timezone.datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc).isoformat(),
+                })
+        return Response(files)
 
 
 class HolidayListCreateView(views.APIView):

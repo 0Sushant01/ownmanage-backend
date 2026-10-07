@@ -21,6 +21,15 @@ class AttendanceStatus(models.TextChoices):
     NOT_MARKED = 'NOT_MARKED', _('Not Marked')
 
 
+class AttendanceMethod(models.TextChoices):
+    """
+    Unified attendance capture and verification methods.
+    """
+    NORMAL = 'NORMAL', _('Normal Punch')
+    QR = 'QR', _('QR Code')
+    FACE = 'FACE', _('Face Recognition')
+
+
 class AttendanceEventType(models.TextChoices):
     """
     Punch event types supporting multi-punch check-in/out and breaks.
@@ -45,6 +54,7 @@ class AttendanceDay(TimeStampedUUIDModel):
     """
     Daily attendance summary for an employee on a calendar date.
     Maintains denormalized totals while individual AttendanceEvents remain authoritative.
+    Unified model supporting Normal, QR, and Face Recognition with optional Location verification.
     """
     business = models.ForeignKey(
         'organization.Business',
@@ -73,6 +83,31 @@ class AttendanceDay(TimeStampedUUIDModel):
         default=AttendanceStatus.PRESENT,
         verbose_name=_('Status')
     )
+    attendance_method = models.CharField(
+        max_length=30,
+        choices=AttendanceMethod.choices,
+        default=AttendanceMethod.NORMAL,
+        verbose_name=_('Attendance Method')
+    )
+    location_verified = models.BooleanField(
+        default=False,
+        verbose_name=_('Location Verified')
+    )
+    verification_metadata = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name=_('Verification Metadata')
+    )
+    check_in = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_('Check In Timestamp')
+    )
+    check_out = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_('Check Out Timestamp')
+    )
     total_work_seconds = models.PositiveIntegerField(
         default=0,
         verbose_name=_('Total Work Seconds'),
@@ -95,7 +130,51 @@ class AttendanceDay(TimeStampedUUIDModel):
         verbose_name=_('Is Locked'),
         help_text=_('Locks the day from further check-in edits once payroll for this period is approved.')
     )
+    is_overridden = models.BooleanField(
+        default=False,
+        verbose_name=_('Is Overridden / Manually Edited')
+    )
+    overridden_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='attendance_overrides',
+        verbose_name=_('Overridden By')
+    )
+    overridden_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_('Overridden At')
+    )
+    override_reason = models.TextField(
+        blank=True,
+        verbose_name=_('Override Reason')
+    )
+    original_check_in = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_('Original Check In')
+    )
+    original_check_out = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_('Original Check Out')
+    )
+    original_status = models.CharField(
+        max_length=30,
+        blank=True,
+        verbose_name=_('Original Status')
+    )
     notes = models.TextField(blank=True, verbose_name=_('Notes'))
+
+    @property
+    def working_minutes(self) -> int:
+        return self.total_work_seconds // 60
+
+    @property
+    def overtime_minutes(self) -> int:
+        return self.overtime_seconds // 60
 
     class Meta:
         verbose_name = _('Attendance Day')
@@ -112,6 +191,7 @@ class AttendanceDay(TimeStampedUUIDModel):
             models.Index(fields=['employee', '-attendance_date'], name='idx_att_emp_date'),
             models.Index(fields=['centre', '-attendance_date'], name='idx_att_centre_date'),
             models.Index(fields=['business', 'status'], name='idx_att_biz_status'),
+            models.Index(fields=['business', 'attendance_method'], name='idx_att_biz_method'),
         ]
 
     def __str__(self):
@@ -121,7 +201,7 @@ class AttendanceDay(TimeStampedUUIDModel):
 class AttendanceEvent(TimeStampedUUIDModel):
     """
     Authoritative, immutable raw punch event (Check-in, Check-out, Break start/end).
-    Captures exact timestamp, geolocation, and device telemetry.
+    Captures exact timestamp, geolocation, attendance method, and device telemetry.
     """
     business = models.ForeignKey(
         'organization.Business',
@@ -146,6 +226,12 @@ class AttendanceEvent(TimeStampedUUIDModel):
         choices=AttendanceEventType.choices,
         verbose_name=_('Event Type')
     )
+    attendance_method = models.CharField(
+        max_length=30,
+        choices=AttendanceMethod.choices,
+        default=AttendanceMethod.NORMAL,
+        verbose_name=_('Attendance Method')
+    )
     event_time = models.DateTimeField(
         db_index=True,
         verbose_name=_('Event Timestamp (UTC)')
@@ -168,6 +254,15 @@ class AttendanceEvent(TimeStampedUUIDModel):
         null=True,
         blank=True,
         verbose_name=_('Location Accuracy (Meters)')
+    )
+    location_verified = models.BooleanField(
+        default=False,
+        verbose_name=_('Location Verified')
+    )
+    verification_metadata = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name=_('Verification Metadata')
     )
     device_id = models.CharField(
         max_length=150,
@@ -458,6 +553,7 @@ class AttendancePolicy(TimeStampedUUIDModel):
     ot_grace_minutes = models.PositiveIntegerField(default=30, verbose_name=_('Overtime Grace Minutes'))
     ot_approval_required = models.BooleanField(default=True, verbose_name=_('Overtime Approval Required'))
     max_daily_ot_minutes = models.PositiveIntegerField(default=240, verbose_name=_('Maximum Daily Overtime Minutes'))
+    ot_rate_multiplier = models.DecimalField(max_digits=4, decimal_places=2, default=1.00, verbose_name=_('Overtime Rate Multiplier'))
 
     # Attendance Capture Modes (Feature Flags)
     allow_normal_punch = models.BooleanField(default=True, verbose_name=_('Allow Normal Check-In'))
@@ -514,6 +610,7 @@ class AttendancePolicyOverride(TimeStampedUUIDModel):
     # Overtime Overrides
     ot_enabled = models.BooleanField(null=True, blank=True, verbose_name=_('Overtime Enabled Override'))
     ot_grace_minutes = models.PositiveIntegerField(null=True, blank=True, verbose_name=_('OT Grace Override'))
+    ot_rate_multiplier = models.DecimalField(max_digits=4, decimal_places=2, null=True, blank=True, verbose_name=_('Overtime Rate Multiplier Override'))
 
     # Verification Method Overrides
     allow_normal_punch = models.BooleanField(null=True, blank=True, verbose_name=_('Allow Normal Punch Override'))

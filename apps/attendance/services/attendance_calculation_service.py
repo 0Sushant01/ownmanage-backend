@@ -142,16 +142,43 @@ class AttendanceCalculationService:
         # Overtime calculation
         overtime_seconds = 0
         if ot_enabled:
+            ot_seconds_candidates = []
             standard_day_seconds = min_present * 60
+
+            # Candidate 1: Checkout past shift end time plus OT grace
+            if last_check_out:
+                local_last_out = last_check_out.astimezone(biz_tz)
+                try:
+                    end_h, end_m = [int(x) for x in str(office_end_str).split(':')[:2]]
+                    expected_end = datetime.combine(local_last_out.date(), time(end_h, end_m), tzinfo=biz_tz)
+                    ot_cutoff = expected_end + timedelta(minutes=ot_grace)
+                    if local_last_out > ot_cutoff:
+                        ot_seconds_candidates.append(int((local_last_out - expected_end).total_seconds()))
+                except Exception:
+                    pass
+
+            # Candidate 2: Worked duration exceeds standard day + OT grace
             if total_seconds > (standard_day_seconds + (ot_grace * 60)):
-                overtime_seconds = total_seconds - standard_day_seconds
+                ot_seconds_candidates.append(total_seconds - standard_day_seconds)
+
+            if ot_seconds_candidates:
+                overtime_seconds = max(ot_seconds_candidates)
+                max_ot = int(policy.get('max_daily_ot_minutes', 240)) * 60
+                if max_ot > 0:
+                    overtime_seconds = min(overtime_seconds, max_ot)
+        else:
+            overtime_seconds = 0
 
         # Status resolution
         worked_minutes = int(total_seconds / 60)
         is_late = (late_minutes >= late_threshold) if late_threshold > 0 else (late_minutes > 0)
         is_early_leave = (early_leave_minutes >= early_checkout_threshold) if early_checkout_threshold > 0 else (early_leave_minutes > 15)
 
-        if worked_minutes >= min_present:
+        is_session_active = bool(current_session_start is not None)
+        if is_session_active and not last_check_out:
+            # Active ongoing check-in session (employee currently clocked in)
+            final_status = AttendanceStatus.LATE if is_late else AttendanceStatus.PRESENT
+        elif worked_minutes >= min_present:
             if is_late:
                 final_status = AttendanceStatus.LATE
             elif is_early_leave:
@@ -165,17 +192,27 @@ class AttendanceCalculationService:
         else:
             final_status = AttendanceStatus.ABSENT
 
+        first_in_evt = next((e for e in events if e.event_type == AttendanceEventType.CHECK_IN), None)
+        method_used = getattr(first_in_evt, 'attendance_method', None) or day.attendance_method or 'NORMAL'
+        loc_verified = any(getattr(e, 'location_verified', False) for e in events) or day.location_verified
+
         result = {
             'status': final_status,
             'total_work_seconds': total_seconds,
             'overtime_seconds': overtime_seconds,
             'late_minutes': late_minutes,
             'early_leave_minutes': early_leave_minutes,
+            'attendance_method': method_used,
+            'location_verified': loc_verified,
+            'check_in': first_check_in,
+            'check_out': last_check_out,
             'calculation_metadata': {
                 'worked_minutes': worked_minutes,
                 'min_present_minutes': min_present,
                 'min_half_day_minutes': min_half_day,
                 'grace_period_minutes': grace_period,
+                'ot_enabled': ot_enabled,
+                'ot_grace_minutes': ot_grace,
             }
         }
 
@@ -185,12 +222,22 @@ class AttendanceCalculationService:
             day.overtime_seconds = overtime_seconds
             day.late_minutes = late_minutes
             day.early_leave_minutes = early_leave_minutes
+            day.attendance_method = method_used
+            day.location_verified = loc_verified
+            if first_check_in:
+                day.check_in = first_check_in
+            if last_check_out:
+                day.check_out = last_check_out
             day.save(update_fields=[
                 'status',
                 'total_work_seconds',
                 'overtime_seconds',
                 'late_minutes',
                 'early_leave_minutes',
+                'attendance_method',
+                'location_verified',
+                'check_in',
+                'check_out',
                 'updated_at'
             ])
 

@@ -1,4 +1,4 @@
-from django.urls import path
+from django.urls import path, include
 from rest_framework_simplejwt.views import TokenRefreshView
 
 from apps.accounts.views import (
@@ -16,6 +16,8 @@ from apps.organization.views import (
 from apps.attendance.views import (
     AttendanceTodayView, AttendanceCheckInView, AttendanceCheckOutView,
     AttendanceHistoryView, AttendanceCalendarView, AttendanceDailyRegisterView,
+    AttendanceRecordDetailView, AttendanceRecordOverrideView, AttendanceQRTokenView,
+    AttendanceMonthlyRegisterView,
     WorkScheduleListView, AttendanceCorrectionListCreateView,
     AttendanceCorrectionApproveView, AttendanceCorrectionRejectView
 )
@@ -40,6 +42,7 @@ from apps.organization.access_views import (
     PermissionListView, ManagerAccessControlView,
     DesignationListCreateView, DesignationDetailView,
     EmployeeDocumentListCreateView, EmployeeDocumentDetailView, EmployeeDocumentVerifyView,
+    EmployeeDocumentDownloadView, AvailableDocumentFilesView,
     HolidayListCreateView, HolidayDetailView
 )
 from apps.attendance.policy_views import (
@@ -140,7 +143,9 @@ urlpatterns = [
 
     # Documents
     path('documents/<uuid:pk>/', EmployeeDocumentDetailView.as_view(), name='api-document-detail'),
+    path('documents/<uuid:pk>/download/', EmployeeDocumentDownloadView.as_view(), name='api-document-download'),
     path('documents/<uuid:pk>/verify/', EmployeeDocumentVerifyView.as_view(), name='api-document-verify'),
+    path('documents/available-files/', AvailableDocumentFilesView.as_view(), name='api-document-available-files'),
 
     # Work Schedules
     path('schedules/', WorkScheduleListView.as_view(), name='api-schedules'),
@@ -148,6 +153,10 @@ urlpatterns = [
     # Attendance
     path('attendance/register/', AttendanceDailyRegisterView.as_view(), name='api-attendance-register'),
     path('attendance/daily-register/', AttendanceDailyRegisterView.as_view(), name='api-attendance-daily-register'),
+    path('attendance/monthly-register/', AttendanceMonthlyRegisterView.as_view(), name='api-attendance-monthly-register'),
+    path('attendance/records/<uuid:pk>/', AttendanceRecordDetailView.as_view(), name='api-attendance-record-detail'),
+    path('attendance/records/<uuid:pk>/override/', AttendanceRecordOverrideView.as_view(), name='api-attendance-record-override'),
+    path('attendance/qr/centre-token/', AttendanceQRTokenView.as_view(), name='api-attendance-qr-token'),
     path('attendance/today/', AttendanceTodayView.as_view(), name='api-attendance-today'),
     path('attendance/check-in/', AttendanceCheckInView.as_view(), name='api-attendance-checkin'),
     path('attendance/check-out/', AttendanceCheckOutView.as_view(), name='api-attendance-checkout'),
@@ -181,4 +190,7 @@ urlpatterns = [
     path('attendance/reports/monthly/', AttendanceMonthlyReportView.as_view(), name='api-attendance-report-monthly'),
     path('salary/reports/payroll-register/', PayrollRegisterReportView.as_view(), name='api-payroll-register-report'),
     path('organization/reports/centre-comparison/', CentreComparisonReportView.as_view(), name='api-centre-comparison-report'),
+
+    # Biometrics Subsystem
+    path('biometrics/', include('apps.biometrics.urls', namespace='biometrics')),
 ]

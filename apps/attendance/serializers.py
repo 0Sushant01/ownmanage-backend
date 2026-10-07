@@ -6,8 +6,9 @@ class AttendanceEventSerializer(serializers.ModelSerializer):
     class Meta:
         model = AttendanceEvent
         fields = [
-            'id', 'event_type', 'event_time', 'latitude', 'longitude',
-            'location_accuracy', 'device_id', 'source', 'notes'
+            'id', 'event_type', 'attendance_method', 'event_time', 'latitude', 'longitude',
+            'location_accuracy', 'location_verified', 'verification_metadata',
+            'device_id', 'source', 'notes'
         ]
         read_only_fields = ['id', 'event_time']
 
@@ -15,21 +16,39 @@ class AttendanceEventSerializer(serializers.ModelSerializer):
 class AttendanceDaySerializer(serializers.ModelSerializer):
     employee_name = serializers.CharField(source='employee.full_name', read_only=True)
     employee_id_code = serializers.CharField(source='employee.employee_id', read_only=True)
+    centre_name = serializers.CharField(source='centre.name', read_only=True, default='—')
+    centre_id = serializers.CharField(source='centre.id', read_only=True, default=None)
+    department_name = serializers.CharField(source='employee.department.name', read_only=True, default='—')
+    designation_name = serializers.CharField(source='employee.designation', read_only=True, default='—')
+    overridden_by_name = serializers.CharField(source='overridden_by.full_name', read_only=True, default=None)
     events = AttendanceEventSerializer(many=True, read_only=True)
     work_hours_display = serializers.SerializerMethodField()
+    ot_hours_display = serializers.SerializerMethodField()
 
     class Meta:
         model = AttendanceDay
         fields = [
             'id', 'employee', 'employee_name', 'employee_id_code',
-            'attendance_date', 'status', 'total_work_seconds',
-            'work_hours_display', 'is_locked', 'notes', 'events', 'created_at'
+            'centre_id', 'centre_name', 'department_name', 'designation_name',
+            'attendance_date', 'status', 'attendance_method', 'location_verified',
+            'verification_metadata', 'check_in', 'check_out',
+            'total_work_seconds', 'overtime_seconds', 'working_minutes', 'overtime_minutes',
+            'late_minutes', 'early_leave_minutes', 'work_hours_display', 'ot_hours_display',
+            'is_locked', 'is_overridden', 'overridden_by', 'overridden_by_name',
+            'overridden_at', 'override_reason', 'original_check_in', 'original_check_out',
+            'original_status', 'notes', 'events', 'created_at', 'updated_at'
         ]
 
     def get_work_hours_display(self, obj):
         total_seconds = obj.total_work_seconds or 0
         hours = total_seconds // 3600
         minutes = (total_seconds % 3600) // 60
+        return f"{hours:02d}h {minutes:02d}m"
+
+    def get_ot_hours_display(self, obj):
+        ot_sec = obj.overtime_seconds or 0
+        hours = ot_sec // 3600
+        minutes = (ot_sec % 3600) // 60
         return f"{hours:02d}h {minutes:02d}m"
 
 
@@ -74,10 +93,10 @@ class AttendancePolicySerializer(serializers.ModelSerializer):
             'grace_period_minutes', 'minimum_present_minutes', 'minimum_half_day_minutes',
             'late_threshold_minutes', 'early_checkout_threshold_minutes',
             'auto_attendance', 'allow_center_override', 'ot_enabled', 'ot_grace_minutes',
-            'ot_approval_required', 'max_daily_ot_minutes', 'allow_normal_punch',
-            'allow_gps', 'allow_geofencing', 'allow_qr', 'allow_face_recognition',
-            'allow_biometric', 'gps_latitude', 'gps_longitude', 'gps_radius_meters',
-            'location_required_checkin', 'location_required_checkout',
+            'ot_approval_required', 'max_daily_ot_minutes', 'ot_rate_multiplier',
+            'allow_normal_punch', 'allow_gps', 'allow_geofencing', 'allow_qr',
+            'allow_face_recognition', 'allow_biometric', 'gps_latitude', 'gps_longitude',
+            'gps_radius_meters', 'location_required_checkin', 'location_required_checkout',
             'extra_settings', 'created_at'
         ]
         read_only_fields = ['id', 'business', 'created_at']
@@ -92,7 +111,7 @@ class AttendancePolicyOverrideSerializer(serializers.ModelSerializer):
             'weekly_off', 'weekly_off_days', 'daily_schedules',
             'grace_period_minutes', 'minimum_present_minutes', 'minimum_half_day_minutes',
             'late_threshold_minutes', 'early_checkout_threshold_minutes',
-            'auto_attendance', 'ot_enabled', 'ot_grace_minutes',
+            'auto_attendance', 'ot_enabled', 'ot_grace_minutes', 'ot_rate_multiplier',
             'allow_normal_punch', 'allow_gps', 'allow_geofencing', 'allow_qr',
             'allow_face_recognition', 'allow_biometric',
             'gps_latitude', 'gps_longitude', 'gps_radius_meters',

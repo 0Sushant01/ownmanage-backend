@@ -36,7 +36,7 @@ class EmployeeSalaryRevisionListCreateView(views.APIView):
 
     def get(self, request, pk):
         emp = self.get_employee(request, pk)
-        revisions = SalaryRevision.objects.filter(employee=emp).order_by('-effective_from')
+        revisions = SalaryRevision.objects.filter(employee=emp).order_by('-effective_from', '-created_at')
         return Response(SalaryRevisionSerializer(revisions, many=True).data)
 
     def post(self, request, pk):
@@ -69,15 +69,19 @@ class EmployeeSalaryRevisionListCreateView(views.APIView):
                 'detail': 'Historical finalized payroll will NOT be silently recalculated. Please confirm to proceed.'
             }, status=status.HTTP_409_CONFLICT)
 
-        # Close out previous revision's effective_to if active
-        prev = SalaryRevision.objects.filter(
+        # Remove duplicate revisions on the same effective_from date
+        SalaryRevision.objects.filter(employee=emp, effective_from=eff_from).delete()
+
+        # Close out previous active revisions whose effective_from is before eff_from
+        prior_revisions = SalaryRevision.objects.filter(
             employee=emp,
             effective_to__isnull=True,
             effective_from__lt=eff_from
-        ).first()
-        if prev:
-            prev.effective_to = eff_from
-            prev.save(update_fields=['effective_to'])
+        )
+        prev = prior_revisions.first()
+        for p_rev in prior_revisions:
+            p_rev.effective_to = eff_from
+            p_rev.save(update_fields=['effective_to'])
 
         revision = serializer.save(
             business=emp.business,
@@ -132,13 +136,49 @@ class EmployeeSalaryComparisonView(views.APIView):
         if not ctx['is_superadmin'] and emp.business_id != ctx['business'].id:
             raise PermissionDenied('Cross-tenant employee access forbidden.')
 
-        revisions = list(SalaryRevision.objects.filter(employee=emp).select_related('revised_by').order_by('-effective_from'))
+        rev_from_id = request.query_params.get('revision_from')
+        rev_to_id = request.query_params.get('revision_to')
+        if rev_from_id and rev_to_id:
+            rev_from = SalaryRevision.objects.filter(id=rev_from_id, employee=emp).select_related('revised_by').first()
+            rev_to = SalaryRevision.objects.filter(id=rev_to_id, employee=emp).select_related('revised_by').first()
+            if rev_from and rev_to:
+                from_val = float(rev_from.basic_salary)
+                to_val = float(rev_to.basic_salary)
+                diff = to_val - from_val
+                pct = round((diff / from_val * 100), 2) if from_val > 0 else 0.0
+                return Response({
+                    'employee_id': str(emp.id),
+                    'employee_name': emp.full_name,
+                    'comparisons': [{
+                        'revision_id': str(rev_to.id),
+                        'effective_from': str(rev_to.effective_from),
+                        'effective_to': str(rev_to.effective_to) if rev_to.effective_to else 'Present',
+                        'new_salary': to_val,
+                        'previous_salary': from_val,
+                        'difference': diff,
+                        'percentage': pct,
+                        'currency': rev_to.currency,
+                        'reason': rev_to.reason or 'Regular revision',
+                        'changed_by': rev_to.revised_by.get_full_name() if rev_to.revised_by else 'System Admin',
+                        'is_current': rev_to.effective_to is None,
+                    }]
+                })
+
+        revisions = list(SalaryRevision.objects.filter(employee=emp).select_related('revised_by').order_by('-effective_from', '-created_at'))
         if not revisions:
             return Response({
                 'employee_id': str(emp.id),
                 'employee_name': emp.full_name,
                 'comparisons': []
             })
+
+        today = timezone.localdate() if hasattr(timezone, 'localdate') else timezone.now().date()
+        current_rev = None
+        for r in revisions:
+            if r.effective_from <= today and (r.effective_to is None or r.effective_to >= today):
+                current_rev = r
+                break
+        current_rev_id = str(current_rev.id) if current_rev else None
 
         comparisons = []
         for i in range(len(revisions)):
@@ -149,6 +189,9 @@ class EmployeeSalaryComparisonView(views.APIView):
             prev_val = float(prev.basic_salary) if prev else 0.0
             diff = curr_val - prev_val
             pct = round((diff / prev_val * 100), 2) if prev_val > 0 else 0.0
+
+            is_upcoming = (curr.effective_from > today)
+            is_current = (str(curr.id) == current_rev_id)
 
             comparisons.append({
                 'revision_id': str(curr.id),
@@ -161,7 +204,9 @@ class EmployeeSalaryComparisonView(views.APIView):
                 'currency': curr.currency,
                 'reason': curr.reason or 'Regular revision',
                 'changed_by': curr.revised_by.get_full_name() if curr.revised_by else 'System Admin',
-                'is_current': (curr.effective_to is None),
+                'is_current': is_current,
+                'is_upcoming': is_upcoming,
+                'status': 'UPCOMING' if is_upcoming else ('CURRENT' if is_current else 'HISTORICAL'),
             })
 
         return Response({

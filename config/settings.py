@@ -45,6 +45,7 @@ INSTALLED_APPS = [
     'apps.leaves',
     'apps.payroll',
     'apps.subscriptions',
+    'apps.biometrics',
 ]
 
 # Custom User Model
@@ -137,6 +138,10 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 MEDIA_URL = 'media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
+# Dedicated Document Storage Directory (Employee Documents Repository)
+DOCUMENTS_STORAGE_DIR = Path(os.getenv('DOCUMENTS_STORAGE_DIR', str(BASE_DIR.parent / 'document')))
+DOCUMENTS_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
 # Default primary key field type
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
@@ -177,6 +182,7 @@ if DEBUG:
         'http://localhost:8081', 'http://127.0.0.1:8081',
         'http://localhost:19006', 'http://127.0.0.1:19006',
         'http://localhost:3000', 'http://127.0.0.1:3000',
+        'http://*'
     ]:
         if dev_origin not in CORS_ALLOWED_ORIGINS:
             CORS_ALLOWED_ORIGINS.append(dev_origin)

@@ -133,6 +133,17 @@ class SubscriptionSerializer(serializers.ModelSerializer):
             }
         return None
 
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        if instance.plan:
+            ret['plan'] = PlanSerializer(instance.plan).data
+            ret['plan_id'] = str(instance.plan.id)
+            ret['plan_name'] = instance.plan.name
+            ret['monthly_charge'] = str(instance.plan.monthly_charge)
+            ret['max_centres'] = instance.plan.max_centres
+            ret['total_employee_capacity'] = instance.plan.total_employee_capacity
+        return ret
+
 
 class SubscriptionHistorySerializer(serializers.ModelSerializer):
     plan_name = serializers.CharField(source='plan.name', read_only=True)

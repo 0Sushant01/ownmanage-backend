@@ -15,7 +15,7 @@ from apps.subscriptions.serializers import (
     CentreCapacityAllocationSerializer, BrokerSerializer, ReferralSerializer,
     CommissionSerializer
 )
-from apps.subscriptions.services import allocate_centre_capacity, change_subscription_plan
+from apps.subscriptions.services import allocate_centre_capacity, change_subscription_plan, renew_subscription
 
 
 def get_annotated_plans_queryset():
@@ -188,23 +188,33 @@ class SubscriptionDetailView(views.APIView):
         return Response(SubscriptionSerializer(sub).data)
 
     def post(self, request):
-        """Assign or change subscription plan (Upgrade / Downgrade)"""
+        """Assign, change, or renew subscription plan (Upgrade / Downgrade / Renewal)"""
         ctx = get_user_context(request)
         if not ctx['is_superadmin']:
-            raise PermissionDenied('Only SuperAdmin can assign or change enterprise subscription plans.')
+            raise PermissionDenied('Only SuperAdmin can assign, change, or renew enterprise subscription plans.')
 
         biz_id = request.data.get('business_id')
         plan_id = request.data.get('plan_id')
         reason = request.data.get('reason', '')
+        action = request.data.get('action', '')
 
-        if not biz_id or not plan_id:
-            raise ValidationError({'detail': 'business_id and plan_id are required.'})
+        if not biz_id:
+            raise ValidationError({'detail': 'business_id is required.'})
 
         biz = Business.objects.filter(id=biz_id).first()
-        plan = Plan.objects.filter(id=plan_id).first()
+        if not biz:
+            raise NotFound('Business not found.')
 
-        if not biz or not plan:
-            raise NotFound('Business or Plan not found.')
+        if action == 'renew':
+            sub = renew_subscription(biz, reason)
+            return Response(SubscriptionSerializer(sub).data, status=status.HTTP_200_OK)
+
+        if not plan_id:
+            raise ValidationError({'detail': 'plan_id is required.'})
+
+        plan = Plan.objects.filter(id=plan_id).first()
+        if not plan:
+            raise NotFound('Plan not found.')
 
         sub = change_subscription_plan(biz, plan, reason)
         return Response(SubscriptionSerializer(sub).data, status=status.HTTP_200_OK)
