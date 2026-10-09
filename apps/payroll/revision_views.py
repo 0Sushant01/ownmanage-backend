@@ -494,6 +494,13 @@ class PayrollRunFinalizeView(views.APIView):
         if not PermissionService.has_permission(request.user, 'payroll.finalize', business=biz):
             raise PermissionDenied('You do not have permission to finalize payroll runs.')
 
+        # Enforce approval requirement if enabled in the effective payroll schedule
+        from apps.payroll.services.payroll_schedule_service import PayrollScheduleService
+        schedule = PayrollScheduleService.resolve_schedule(centre=run.centre, business=biz)
+        if schedule['effective_config'].get('approval_required', True):
+            if run.status != PayrollRunStatus.APPROVED and not ctx['is_superadmin']:
+                raise ValidationError({'detail': 'This payroll run requires approval before it can be finalized.'})
+
         run.status = PayrollRunStatus.FINALIZED
         run.finalized_at = timezone.now()
         run.save(update_fields=['status', 'finalized_at', 'updated_at'])

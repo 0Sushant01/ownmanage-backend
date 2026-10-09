@@ -39,7 +39,7 @@ from apps.core.views import (
     NotificationListView, NotificationMarkReadView, AuditLogListView
 )
 from apps.organization.access_views import (
-    PermissionListView, ManagerAccessControlView,
+    PermissionListView, ManagerAccessControlView, ManagerAccessControlResetView,
     DesignationListCreateView, DesignationDetailView,
     EmployeeDocumentListCreateView, EmployeeDocumentDetailView, EmployeeDocumentVerifyView,
     EmployeeDocumentDownloadView, AvailableDocumentFilesView,
@@ -54,6 +54,11 @@ from apps.payroll.revision_views import (
     PayrollRunApproveView, PayrollRunFinalizeView,
     EmployeeSalaryComparisonView, EmployeeCompensationItemListCreateView,
     EmployeeCompensationItemDetailView
+)
+from apps.payroll.schedule_views import (
+    EmployeePayrollScheduleView, EmployeePayrollScheduleResetView,
+    CentrePayrollScheduleView, CentrePayrollScheduleResetView,
+    EnterprisePayrollScheduleView, PayrollSchedulePeriodsPreviewView
 )
 from apps.core.reports_views import (
     AttendanceMonthlyReportView, PayrollRegisterReportView, CentreComparisonReportView
@@ -109,6 +114,7 @@ urlpatterns = [
     path('managers/', ManagerListView.as_view(), name='api-managers'),
     path('managers/<uuid:pk>/', ManagerDetailView.as_view(), name='api-manager-detail'),
     path('managers/<uuid:pk>/access-control/', ManagerAccessControlView.as_view(), name='api-manager-access-control'),
+    path('managers/<uuid:pk>/access-control/reset/', ManagerAccessControlResetView.as_view(), name='api-manager-access-control-reset'),
 
     # Permissions & Granular Access Control
     path('permissions/', PermissionListView.as_view(), name='api-permissions'),
@@ -118,6 +124,8 @@ urlpatterns = [
     path('centres/<uuid:pk>/', CentreDetailView.as_view(), name='api-centre-detail'),
     path('centres/<uuid:pk>/attendance-policy/', CentreAttendancePolicyView.as_view(), name='api-centre-attendance-policy'),
     path('centres/<uuid:pk>/attendance-policy/reset/', CentreAttendancePolicyResetView.as_view(), name='api-centre-attendance-policy-reset'),
+    path('centres/<uuid:pk>/payroll-schedule/', CentrePayrollScheduleView.as_view(), name='api-centre-payroll-schedule'),
+    path('centres/<uuid:pk>/payroll-schedule/reset/', CentrePayrollScheduleResetView.as_view(), name='api-centre-payroll-schedule-reset'),
 
     # Departments & Designations
     path('departments/', DepartmentListCreateView.as_view(), name='api-departments'),
@@ -139,6 +147,8 @@ urlpatterns = [
     path('employees/<uuid:pk>/salary-comparison/', EmployeeSalaryComparisonView.as_view(), name='api-employee-salary-comparison'),
     path('employees/<uuid:pk>/compensation-items/', EmployeeCompensationItemListCreateView.as_view(), name='api-employee-comp-items'),
     path('employees/<uuid:pk>/compensation-items/<uuid:comp_pk>/', EmployeeCompensationItemDetailView.as_view(), name='api-employee-comp-item-detail'),
+    path('employees/<uuid:pk>/payroll-schedule/', EmployeePayrollScheduleView.as_view(), name='api-employee-payroll-schedule'),
+    path('employees/<uuid:pk>/payroll-schedule/reset/', EmployeePayrollScheduleResetView.as_view(), name='api-employee-payroll-schedule-reset'),
     path('employees/<uuid:pk>/working-hours/', EmployeeWorkingHoursView.as_view(), name='api-employee-working-hours'),
 
     # Documents
@@ -181,6 +191,8 @@ urlpatterns = [
     path('payroll/runs/', PayrollRunListCreateView.as_view(), name='api-payroll-runs'),
     path('payroll/runs/<uuid:pk>/approve/', PayrollRunApproveView.as_view(), name='api-payroll-run-approve'),
     path('payroll/runs/<uuid:pk>/finalize/', PayrollRunFinalizeView.as_view(), name='api-payroll-run-finalize'),
+    path('payroll/schedule-enterprise/', EnterprisePayrollScheduleView.as_view(), name='api-payroll-schedule-enterprise'),
+    path('payroll/schedule-periods/', PayrollSchedulePeriodsPreviewView.as_view(), name='api-payroll-schedule-periods'),
 
     # Notifications
     path('notifications/', NotificationListView.as_view(), name='api-notifications'),
@@ -193,4 +205,7 @@ urlpatterns = [
 
     # Biometrics Subsystem
     path('biometrics/', include('apps.biometrics.urls', namespace='biometrics')),
+
+    # Meetings Subsystem
+    path('meetings/', include('apps.meetings.urls')),
 ]

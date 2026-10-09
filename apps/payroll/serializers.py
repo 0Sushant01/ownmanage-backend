@@ -32,7 +32,8 @@ class PayrollSerializer(serializers.ModelSerializer):
             'id', 'employee', 'employee_name', 'employee_id_code', 'department_name',
             'period_start', 'period_end', 'paid_days', 'unpaid_days', 'half_days',
             'ot_hours', 'gross_amount', 'total_deductions', 'net_amount',
-            'currency', 'status', 'generated_at', 'payslip', 'line_items'
+            'currency', 'status', 'generated_at', 'payslip', 'line_items',
+            'salary_snapshot', 'schedule_snapshot'
         ]
 
 
@@ -100,7 +101,8 @@ class PayrollRunSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'business', 'centre', 'centre_name', 'period_start', 'period_end',
             'status', 'total_employees', 'total_gross', 'total_deductions', 'total_net',
-            'approved_by', 'approved_by_name', 'finalized_at', 'created_at'
+            'approved_by', 'approved_by_name', 'finalized_at', 'created_at',
+            'expected_payment_date', 'generation_mode', 'pay_frequency', 'schedule_config'
         ]
         read_only_fields = ['id', 'business', 'approved_by', 'finalized_at', 'created_at']
 
@@ -152,4 +154,39 @@ class EmployeeCompensationItemSerializer(serializers.ModelSerializer):
             if obj.effective_to < today:
                 return 'EXPIRED'
         return 'ACTIVE'
+
+
+class PayrollScheduleConfigSerializer(serializers.ModelSerializer):
+    changed_by_name = serializers.CharField(source='changed_by.get_full_name', read_only=True)
+    centre_name = serializers.CharField(source='centre.name', read_only=True)
+    employee_name = serializers.CharField(source='employee.full_name', read_only=True)
+
+    class Meta:
+        from apps.payroll.models import PayrollScheduleConfig
+        model = PayrollScheduleConfig
+        fields = [
+            'id', 'business', 'centre', 'centre_name', 'employee', 'employee_name',
+            'scope', 'has_override', 'is_active', 'effective_from', 'effective_to',
+            'compensation_type', 'pay_frequency', 'week_start_day', 'custom_cycle_start_day',
+            'anchor_date', 'month_end_rule', 'generation_mode', 'generation_delay_days',
+            'generation_day_of_month', 'approval_required', 'approver_role',
+            'review_deadline_days', 'payment_rule', 'payment_offset_days',
+            'payment_day_of_month', 'payment_weekday', 'change_reason',
+            'changed_by', 'changed_by_name', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'business', 'created_at', 'updated_at']
+
+
+class PayrollScheduleHistorySerializer(serializers.ModelSerializer):
+    changed_by_name = serializers.CharField(source='changed_by.get_full_name', read_only=True)
+
+    class Meta:
+        from apps.payroll.models import PayrollScheduleHistory
+        model = PayrollScheduleHistory
+        fields = [
+            'id', 'config', 'business', 'centre', 'employee', 'scope', 'snapshot',
+            'effective_from', 'effective_to', 'change_reason', 'changed_by',
+            'changed_by_name', 'created_at'
+        ]
+        read_only_fields = ['id', 'created_at']
 

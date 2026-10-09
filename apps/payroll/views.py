@@ -54,9 +54,24 @@ class PayrollListView(views.APIView):
             else:
                 qs = qs.none()
 
+        month_param = request.query_params.get('month') or request.query_params.get('period_month')
         period_start = request.query_params.get('period_start')
-        if period_start:
-            qs = qs.filter(period_start__gte=period_start)
+
+        if month_param and '-' in month_param:
+            try:
+                y, m = month_param.split('-')[:2]
+                qs = qs.filter(period_start__year=int(y), period_start__month=int(m))
+            except (ValueError, TypeError):
+                pass
+        elif period_start:
+            if len(period_start) == 7 and '-' in period_start:
+                try:
+                    y, m = period_start.split('-')[:2]
+                    qs = qs.filter(period_start__year=int(y), period_start__month=int(m))
+                except (ValueError, TypeError):
+                    pass
+            else:
+                qs = qs.filter(period_start__gte=period_start)
 
         status_param = request.query_params.get('status')
         if status_param and status_param not in ['all', 'ALL', 'null', '']:

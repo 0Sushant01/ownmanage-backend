@@ -36,6 +36,10 @@ class NotificationType(models.TextChoices):
     ATTENDANCE_ALERT = 'ATTENDANCE_ALERT', _('Attendance Alert')
     ANNOUNCEMENT = 'ANNOUNCEMENT', _('Company Announcement')
     GENERAL = 'GENERAL', _('General Notification')
+    MEETING_INVITATION = 'MEETING_INVITATION', _('Meeting Invitation')
+    MEETING_UPDATE = 'MEETING_UPDATE', _('Meeting Updated / Rescheduled')
+    MEETING_CANCELLED = 'MEETING_CANCELLED', _('Meeting Cancelled')
+    MEETING_REMINDER = 'MEETING_REMINDER', _('Meeting Reminder')
 
 
 class Notification(TimeStampedUUIDModel):

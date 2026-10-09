@@ -164,11 +164,12 @@ class EmployeeListSerializer(serializers.ModelSerializer):
     manager_name = serializers.CharField(source='manager.full_name', read_only=True, default='')
     designation_name = serializers.CharField(source='designation', read_only=True, default='')
     current_salary = serializers.SerializerMethodField()
+    user_id = serializers.UUIDField(source='user.id', read_only=True, default=None)
 
     class Meta:
         model = Employee
         fields = [
-            'id', 'employee_id', 'first_name', 'last_name', 'full_name',
+            'id', 'user_id', 'employee_id', 'first_name', 'last_name', 'full_name',
             'email', 'phone', 'designation', 'designation_name', 'employment_status',
             'joining_date', 'department_name', 'branch_name', 'manager_name',
             'department', 'branch', 'manager', 'current_salary'

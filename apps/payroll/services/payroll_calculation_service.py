@@ -106,21 +106,73 @@ class PayrollCalculationService:
 
         total_calendar_days = (period_end - period_start).days + 1
         effective_working_days = 30  # Standard payroll convention
-        daily_rate = (basic_salary / Decimal(str(effective_working_days))) if effective_working_days > 0 else Decimal('0.00')
+        daily_rate = (basic_salary / Decimal(str(effective_working_days))).quantize(Decimal('0.01')) if effective_working_days > 0 else Decimal('0.00')
+
+        paid_days_effective = Decimal(str(present_count + weekly_off_count + holiday_count)) + (Decimal(str(half_day_count)) * Decimal('0.5')) + paid_leave_days
+
+        # Resolve effective payroll schedule & compensation type
+        from apps.payroll.services.payroll_schedule_service import PayrollScheduleService
+        schedule_res = PayrollScheduleService.resolve_schedule(employee=employee)
+        eff_cfg = schedule_res['effective_config']
+        comp_type = eff_cfg.get('compensation_type', 'MONTHLY_SALARY')
 
         # List of line items to build
         line_items_data: List[Dict[str, Any]] = []
 
-        # Line Item: Base Salary
-        line_items_data.append({
-            'name': 'Base Salary',
-            'line_type': PayrollLineItemType.BASIC,
-            'amount': basic_salary,
-            'rate': daily_rate,
-            'units': Decimal(str(effective_working_days)),
-            'is_deduction': False,
-            'source_compensation_item': None,
-        })
+        if comp_type == 'DAILY_WAGE':
+            base_salary_earned = (daily_rate * paid_days_effective).quantize(Decimal('0.01'))
+            line_items_data.append({
+                'name': f'Daily Wages ({paid_days_effective} days)',
+                'line_type': PayrollLineItemType.BASIC,
+                'amount': base_salary_earned,
+                'rate': daily_rate,
+                'units': paid_days_effective,
+                'is_deduction': False,
+                'source_compensation_item': None,
+            })
+            base_for_gross = base_salary_earned
+            skip_unpaid_penalty = True
+        elif comp_type == 'HOURLY_WAGE':
+            eff_hourly = hourly_rate if hourly_rate > 0 else (basic_salary / Decimal('240.00')).quantize(Decimal('0.01'))
+            sum_work_sec = sum(getattr(d, 'total_work_seconds', 0) for d in attendance_days)
+            hours_worked = Decimal(str(round(sum_work_sec / 3600.0, 2))) if sum_work_sec > 0 else (paid_days_effective * Decimal('8.00'))
+            base_salary_earned = (eff_hourly * hours_worked).quantize(Decimal('0.01'))
+            line_items_data.append({
+                'name': f'Hourly Wages ({hours_worked} hrs)',
+                'line_type': PayrollLineItemType.BASIC,
+                'amount': base_salary_earned,
+                'rate': eff_hourly,
+                'units': hours_worked,
+                'is_deduction': False,
+                'source_compensation_item': None,
+            })
+            base_for_gross = base_salary_earned
+            skip_unpaid_penalty = True
+        elif comp_type == 'FIXED_CONTRACT':
+            line_items_data.append({
+                'name': 'Fixed Contract Payment',
+                'line_type': PayrollLineItemType.BASIC,
+                'amount': basic_salary,
+                'rate': basic_salary,
+                'units': Decimal('1.00'),
+                'is_deduction': False,
+                'source_compensation_item': None,
+            })
+            base_for_gross = basic_salary
+            skip_unpaid_penalty = False
+        else:
+            # MONTHLY_SALARY
+            line_items_data.append({
+                'name': 'Base Salary',
+                'line_type': PayrollLineItemType.BASIC,
+                'amount': basic_salary,
+                'rate': daily_rate,
+                'units': Decimal(str(effective_working_days)),
+                'is_deduction': False,
+                'source_compensation_item': None,
+            })
+            base_for_gross = basic_salary
+            skip_unpaid_penalty = False
 
         # Overtime calculation
         if ot_rate > 0:
@@ -229,7 +281,7 @@ class PayrollCalculationService:
                 })
 
         # Unpaid Leave penalty
-        unpaid_deduction = (unpaid_leave_days * daily_rate).quantize(Decimal('0.01'))
+        unpaid_deduction = Decimal('0.00') if skip_unpaid_penalty else (unpaid_leave_days * daily_rate).quantize(Decimal('0.01'))
         if unpaid_deduction > Decimal('0.00'):
             line_items_data.append({
                 'name': f'Unpaid Leave ({unpaid_leave_days} days)',
@@ -241,11 +293,9 @@ class PayrollCalculationService:
                 'source_compensation_item': None,
             })
 
-        gross_amount = basic_salary + total_comp_earnings + ot_amount
+        gross_amount = base_for_gross + total_comp_earnings + ot_amount
         total_deductions = total_comp_deductions + unpaid_deduction
         net_amount = max(Decimal('0.00'), gross_amount - total_deductions)
-
-        paid_days_effective = Decimal(str(present_count + weekly_off_count + holiday_count)) + (Decimal(str(half_day_count)) * Decimal('0.5')) + paid_leave_days
 
         return {
             'employee_id': str(employee.id),
@@ -268,6 +318,15 @@ class PayrollCalculationService:
                 'unpaid_deduction': float(unpaid_deduction),
                 'total_comp_earnings': float(total_comp_earnings),
                 'total_comp_deductions': float(total_comp_deductions),
+            },
+            'schedule_snapshot': {
+                'source': schedule_res['source'],
+                'source_display': schedule_res['source_display'],
+                'compensation_type': comp_type,
+                'pay_frequency': eff_cfg.get('pay_frequency'),
+                'generation_mode': eff_cfg.get('generation_mode'),
+                'payment_rule': eff_cfg.get('payment_rule'),
+                'expected_payment_date': schedule_res.get('expected_payment_date'),
             }
         }
 
@@ -283,7 +342,27 @@ class PayrollCalculationService:
         """
         Executes a batch payroll run across all active employees in an enterprise or center.
         Creates both the summary Payroll record AND itemized PayrollLineItem rows in a single atomic transaction.
+        Enforces immutability: Finalized payroll runs and paid employee records can never be overwritten.
         """
+        from rest_framework.exceptions import ValidationError
+        from apps.payroll.services.payroll_schedule_service import PayrollScheduleService
+
+        # 1. Protection: Check if a finalized run exists for this period
+        existing_run = PayrollRun.objects.filter(
+            business=business,
+            centre=centre,
+            period_start=period_start,
+            period_end=period_end
+        ).first()
+
+        if existing_run and existing_run.status == PayrollRunStatus.FINALIZED:
+            raise ValidationError('Cannot recalculate a FINALIZED payroll run. Finalized payroll records are immutable.')
+
+        # Resolve effective schedule configuration for this batch scope
+        batch_schedule = PayrollScheduleService.resolve_schedule(centre=centre, business=business)
+        eff_cfg = batch_schedule['effective_config']
+        expected_pay_date = PayrollScheduleService.calculate_expected_payment_date(period_end, eff_cfg)
+
         with transaction.atomic():
             run, _ = PayrollRun.objects.get_or_create(
                 business=business,
@@ -292,11 +371,17 @@ class PayrollCalculationService:
                 period_end=period_end,
                 defaults={
                     'status': PayrollRunStatus.CALCULATING,
-                    'approved_by': approved_by
+                    'approved_by': approved_by,
+                    'expected_payment_date': expected_pay_date,
+                    'pay_frequency': eff_cfg.get('pay_frequency', 'MONTHLY_CALENDAR'),
+                    'generation_mode': eff_cfg.get('generation_mode', 'MANUAL'),
                 }
             )
             run.status = PayrollRunStatus.CALCULATING
-            run.save(update_fields=['status', 'updated_at'])
+            run.expected_payment_date = expected_pay_date
+            run.pay_frequency = eff_cfg.get('pay_frequency', 'MONTHLY_CALENDAR')
+            run.generation_mode = eff_cfg.get('generation_mode', 'MANUAL')
+            run.save(update_fields=['status', 'expected_payment_date', 'pay_frequency', 'generation_mode', 'updated_at'])
 
             emp_qs = Employee.objects.filter(
                 business=business,
@@ -311,6 +396,20 @@ class PayrollCalculationService:
             total_net = Decimal('0.00')
 
             for emp in employees:
+                # Historical immutability: If employee's payroll for this period is already PAID, preserve it
+                existing_emp_payroll = Payroll.objects.filter(
+                    business=business,
+                    employee=emp,
+                    period_start=period_start,
+                    period_end=period_end
+                ).first()
+
+                if existing_emp_payroll and existing_emp_payroll.status == PayrollStatus.PAID:
+                    total_gross += existing_emp_payroll.gross_amount
+                    total_deductions += existing_emp_payroll.total_deductions
+                    total_net += existing_emp_payroll.net_amount
+                    continue
+
                 calc = cls.calculate_employee_payroll(emp, period_start, period_end)
 
                 payroll, _ = Payroll.objects.update_or_create(
@@ -330,6 +429,7 @@ class PayrollCalculationService:
                         'net_amount': calc['net_amount'],
                         'currency': calc['currency'],
                         'salary_snapshot': calc['salary_snapshot'],
+                        'schedule_snapshot': calc['schedule_snapshot'],
                         'status': PayrollStatus.PROCESSED,
                     }
                 )

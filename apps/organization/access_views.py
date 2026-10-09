@@ -111,13 +111,17 @@ class ManagerAccessControlView(views.APIView):
         if manager_emp and manager_emp.branch:
             branch_name = manager_emp.branch.name
 
+        has_override = ManagerAccessControl.objects.filter(business=biz, user=manager_user).exists()
+
         return Response({
             'manager_id': str(manager_user.id),
             'manager_name': manager_user.get_full_name(),
             'manager_email': manager_user.email,
+            'has_override': has_override,
             'permissions': matrix,
             'manager': {
                 'id': str(manager_emp.id) if manager_emp else str(manager_user.id),
+                'user_id': str(manager_user.id),
                 'name': manager_user.get_full_name(),
                 'email': manager_user.email,
                 'branch_name': branch_name,
@@ -179,9 +183,11 @@ class ManagerAccessControlView(views.APIView):
 
         return Response({
             'detail': f'Updated {len(updated)} permissions for {manager_user.get_full_name()}.',
+            'has_override': True,
             'permissions': matrix,
             'manager': {
                 'id': str(manager_emp.id) if manager_emp else str(manager_user.id),
+                'user_id': str(manager_user.id),
                 'name': manager_user.get_full_name(),
                 'email': manager_user.email,
                 'branch_name': branch_name,
@@ -190,6 +196,65 @@ class ManagerAccessControlView(views.APIView):
             'total_permissions': len(matrix),
             'modules': modules
         })
+
+    def delete(self, request, pk):
+        biz, manager_user, manager_emp = self.get_manager_user(request, pk)
+        deleted_count, _ = ManagerAccessControl.objects.filter(business=biz, user=manager_user).delete()
+
+        AuditService.log(
+            user_or_request=request,
+            action='RESET_MANAGER_PERMISSIONS',
+            entity_type='ManagerAccessControl',
+            entity_id=str(manager_user.id),
+            new_data={'deleted_overrides': deleted_count},
+            business=biz,
+            reason=f'Enterprise Admin reset access controls to default for manager {manager_user.email}'
+        )
+
+        matrix = PermissionService.get_manager_access_matrix(business=biz, manager_user=manager_user)
+        modules = {}
+        granted_count = 0
+        for item in matrix:
+            mod_key = item.get('module', 'general')
+            if mod_key not in modules:
+                modules[mod_key] = {
+                    'module_display': mod_key.replace('_', ' ').title(),
+                    'permissions': []
+                }
+            if item.get('is_granted'):
+                granted_count += 1
+            modules[mod_key]['permissions'].append(item)
+
+        branch_name = 'All Centers'
+        if manager_emp and manager_emp.branch:
+            branch_name = manager_emp.branch.name
+
+        return Response({
+            'detail': f'Reset permissions to Enterprise Defaults for {manager_user.get_full_name()}.',
+            'has_override': False,
+            'permissions': matrix,
+            'manager': {
+                'id': str(manager_emp.id) if manager_emp else str(manager_user.id),
+                'user_id': str(manager_user.id),
+                'name': manager_user.get_full_name(),
+                'email': manager_user.email,
+                'branch_name': branch_name,
+            },
+            'granted_count': granted_count,
+            'total_permissions': len(matrix),
+            'modules': modules
+        })
+
+
+class ManagerAccessControlResetView(views.APIView):
+    """
+    Resets custom permissions for a specific manager back to Enterprise Defaults.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        view = ManagerAccessControlView()
+        return view.delete(request, pk)
 
 
 class DesignationListCreateView(views.APIView):

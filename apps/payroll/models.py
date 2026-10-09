@@ -1,8 +1,52 @@
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from apps.core.models import TimeStampedUUIDModel
+
+
+class CompensationType(models.TextChoices):
+    MONTHLY_SALARY = 'MONTHLY_SALARY', _('Fixed Monthly Salary')
+    DAILY_WAGE = 'DAILY_WAGE', _('Daily Wage')
+    HOURLY_WAGE = 'HOURLY_WAGE', _('Hourly Wage')
+    FIXED_CONTRACT = 'FIXED_CONTRACT', _('Fixed Contract Amount')
+
+
+class PayFrequency(models.TextChoices):
+    DAILY = 'DAILY', _('Daily')
+    WEEKLY = 'WEEKLY', _('Weekly')
+    FORTNIGHTLY = 'FORTNIGHTLY', _('Fortnightly')
+    MONTHLY_CALENDAR = 'MONTHLY_CALENDAR', _('Monthly — Calendar')
+    MONTHLY_CUSTOM = 'MONTHLY_CUSTOM', _('Monthly — Custom Cycle')
+    CUSTOM_PERIOD = 'CUSTOM_PERIOD', _('Custom Period')
+
+
+class MonthEndRule(models.TextChoices):
+    CLAMP_TO_LAST_DAY = 'CLAMP_TO_LAST_DAY', _('Clamp to Last Day of Month')
+    NEXT_AVAILABLE_DAY = 'NEXT_AVAILABLE_DAY', _('Next Available Day')
+
+
+class PayrollGenerationMode(models.TextChoices):
+    MANUAL = 'MANUAL', _('Manual Generation')
+    AUTOMATIC_DRAFT_AFTER_PERIOD_END = 'AUTOMATIC_DRAFT_AFTER_PERIOD_END', _('Automatic Draft After Period End')
+    AUTOMATIC_DRAFT_ON_CONFIGURED_DATE = 'AUTOMATIC_DRAFT_ON_CONFIGURED_DATE', _('Automatic Draft on Configured Date')
+    AUTOMATIC_DRAFT_BEFORE_PERIOD_END = 'AUTOMATIC_DRAFT_BEFORE_PERIOD_END', _('Automatic Draft Before Period End')
+
+
+class PaymentScheduleRule(models.TextChoices):
+    SAME_DAY_AS_PERIOD_END = 'SAME_DAY_AS_PERIOD_END', _('Same Day as Period End')
+    DAYS_AFTER_PERIOD_END = 'DAYS_AFTER_PERIOD_END', _('Fixed Days After Period End')
+    SPECIFIED_WEEKDAY = 'SPECIFIED_WEEKDAY', _('Specified Weekday')
+    DAY_OF_FOLLOWING_MONTH = 'DAY_OF_FOLLOWING_MONTH', _('Fixed Day of Following Month')
+    CUSTOM_RULE = 'CUSTOM_RULE', _('Custom Payment Rule')
+    MANUAL = 'MANUAL', _('Manual Selection')
+
+
+class ScheduleConfigScope(models.TextChoices):
+    ENTERPRISE = 'ENTERPRISE', _('Enterprise Default')
+    CENTRE = 'CENTRE', _('Centre Override')
+    EMPLOYEE = 'EMPLOYEE', _('Employee Override')
 
 
 class PayrollStatus(models.TextChoices):
@@ -276,6 +320,31 @@ class PayrollRun(TimeStampedUUIDModel):
         verbose_name=_('Approved By')
     )
     finalized_at = models.DateTimeField(null=True, blank=True, verbose_name=_('Finalized Timestamp'))
+    expected_payment_date = models.DateField(
+        null=True,
+        blank=True,
+        verbose_name=_('Expected Payment Date')
+    )
+    generation_mode = models.CharField(
+        max_length=50,
+        choices=PayrollGenerationMode.choices,
+        default=PayrollGenerationMode.MANUAL,
+        verbose_name=_('Generation Mode')
+    )
+    pay_frequency = models.CharField(
+        max_length=50,
+        choices=PayFrequency.choices,
+        default=PayFrequency.MONTHLY_CALENDAR,
+        verbose_name=_('Pay Frequency')
+    )
+    schedule_config = models.ForeignKey(
+        'payroll.PayrollScheduleConfig',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='payroll_runs',
+        verbose_name=_('Schedule Configuration')
+    )
 
     class Meta:
         verbose_name = _('Payroll Run')
@@ -322,6 +391,7 @@ class Payroll(TimeStampedUUIDModel):
     half_days = models.PositiveSmallIntegerField(default=0, verbose_name=_('Half Days'))
     ot_hours = models.DecimalField(max_digits=6, decimal_places=2, default=0.00, verbose_name=_('Overtime Hours'))
     salary_snapshot = models.JSONField(default=dict, blank=True, verbose_name=_('Frozen Salary Snapshot'))
+    schedule_snapshot = models.JSONField(default=dict, blank=True, verbose_name=_('Frozen Schedule Snapshot'))
     gross_amount = models.DecimalField(
         max_digits=12,
         decimal_places=2,
@@ -561,3 +631,229 @@ class PayrollLineItem(TimeStampedUUIDModel):
     def __str__(self):
         sign = '-' if self.is_deduction else '+'
         return f"{self.payroll.employee}: {self.name} ({sign}{self.amount})"
+
+
+class PayrollScheduleConfig(TimeStampedUUIDModel):
+    """
+    Unified configuration for payroll cycles, compensation type defaults,
+    period boundaries, automatic draft generation, approvals, and disbursement timing.
+    Supports Enterprise Default -> Centre Override -> Employee Override hierarchy.
+    """
+    business = models.ForeignKey(
+        'organization.Business',
+        on_delete=models.CASCADE,
+        related_name='payroll_schedule_configs',
+        verbose_name=_('Business')
+    )
+    centre = models.ForeignKey(
+        'organization.Branch',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='payroll_schedule_configs',
+        verbose_name=_('Centre / Branch')
+    )
+    employee = models.ForeignKey(
+        'organization.Employee',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='payroll_schedule_configs',
+        verbose_name=_('Employee')
+    )
+    scope = models.CharField(
+        max_length=20,
+        choices=ScheduleConfigScope.choices,
+        default=ScheduleConfigScope.ENTERPRISE,
+        verbose_name=_('Configuration Scope')
+    )
+    has_override = models.BooleanField(
+        default=True,
+        verbose_name=_('Has Active Custom Override'),
+        help_text=_('When False, explicitly inherits parent settings (centre inherits enterprise; employee inherits centre).')
+    )
+    is_active = models.BooleanField(
+        default=True,
+        verbose_name=_('Is Active')
+    )
+    effective_from = models.DateField(
+        default=timezone.now,
+        verbose_name=_('Effective From Date')
+    )
+    effective_to = models.DateField(
+        null=True,
+        blank=True,
+        verbose_name=_('Effective To Date')
+    )
+
+    # 1. Compensation Type
+    compensation_type = models.CharField(
+        max_length=30,
+        choices=CompensationType.choices,
+        default=CompensationType.MONTHLY_SALARY,
+        verbose_name=_('Compensation Type')
+    )
+
+    # 2. Pay Frequency & Cycle
+    pay_frequency = models.CharField(
+        max_length=30,
+        choices=PayFrequency.choices,
+        default=PayFrequency.MONTHLY_CALENDAR,
+        verbose_name=_('Pay Frequency')
+    )
+    week_start_day = models.PositiveSmallIntegerField(
+        default=0,
+        verbose_name=_('Week Start Day'),
+        help_text=_('0=Monday, 1=Tuesday, ..., 6=Sunday')
+    )
+    custom_cycle_start_day = models.PositiveSmallIntegerField(
+        default=1,
+        verbose_name=_('Custom Cycle Start Day'),
+        help_text=_('Day of month (1-31) when recurring cycle starts, e.g. 5th of month to 4th of following month.')
+    )
+    anchor_date = models.DateField(
+        null=True,
+        blank=True,
+        verbose_name=_('Anchor Date for Fortnightly / Custom Cycles')
+    )
+    month_end_rule = models.CharField(
+        max_length=30,
+        choices=MonthEndRule.choices,
+        default=MonthEndRule.CLAMP_TO_LAST_DAY,
+        verbose_name=_('Month-End Rule')
+    )
+
+    # 3. Payroll Draft Generation Schedule
+    generation_mode = models.CharField(
+        max_length=50,
+        choices=PayrollGenerationMode.choices,
+        default=PayrollGenerationMode.MANUAL,
+        verbose_name=_('Generation Mode')
+    )
+    generation_delay_days = models.PositiveSmallIntegerField(
+        default=1,
+        verbose_name=_('Generation Processing Delay (Days after period end)')
+    )
+    generation_day_of_month = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        verbose_name=_('Configured Generation Day of Month')
+    )
+
+    # 4. Approval Requirements
+    approval_required = models.BooleanField(
+        default=True,
+        verbose_name=_('Approval Required Before Finalization')
+    )
+    approver_role = models.CharField(
+        max_length=30,
+        default='BUSINESS_ADMIN',
+        verbose_name=_('Approver Role')
+    )
+    review_deadline_days = models.PositiveSmallIntegerField(
+        default=3,
+        verbose_name=_('Review Deadline (Days)')
+    )
+
+    # 5. Expected Payment Schedule
+    payment_rule = models.CharField(
+        max_length=30,
+        choices=PaymentScheduleRule.choices,
+        default=PaymentScheduleRule.DAY_OF_FOLLOWING_MONTH,
+        verbose_name=_('Payment Rule')
+    )
+    payment_offset_days = models.PositiveSmallIntegerField(
+        default=5,
+        verbose_name=_('Payment Offset Days (after period end)')
+    )
+    payment_day_of_month = models.PositiveSmallIntegerField(
+        default=7,
+        verbose_name=_('Payment Day of Following Month')
+    )
+    payment_weekday = models.PositiveSmallIntegerField(
+        default=4,
+        verbose_name=_('Specified Payment Weekday (0=Mon, 4=Fri)')
+    )
+
+    # 6. Audit & Metadata
+    change_reason = models.TextField(
+        blank=True,
+        verbose_name=_('Change Reason')
+    )
+    changed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='schedule_configs_changed',
+        verbose_name=_('Changed By')
+    )
+
+    class Meta:
+        verbose_name = _('Payroll Schedule Configuration')
+        verbose_name_plural = _('Payroll Schedule Configurations')
+        ordering = ['-effective_from', '-created_at']
+        indexes = [
+            models.Index(fields=['business', 'scope', 'is_active'], name='idx_psched_biz_scope'),
+            models.Index(fields=['centre', 'is_active'], name='idx_psched_centre_act'),
+            models.Index(fields=['employee', 'is_active'], name='idx_psched_emp_act'),
+        ]
+
+    def __str__(self):
+        target = f"Employee {self.employee}" if self.employee else (f"Centre {self.centre}" if self.centre else f"Enterprise {self.business.name}")
+        return f"{self.scope} [{target}]: {self.get_pay_frequency_display()} ({self.get_compensation_type_display()})"
+
+
+class PayrollScheduleHistory(TimeStampedUUIDModel):
+    """
+    Append-only snapshot history preserving every prior configuration state.
+    Guarantees historical and finalized payroll records can always verify the exact
+    schedule rules in effect on any past date.
+    """
+    config = models.ForeignKey(
+        PayrollScheduleConfig,
+        on_delete=models.CASCADE,
+        related_name='history_records',
+        verbose_name=_('Schedule Configuration')
+    )
+    business = models.ForeignKey(
+        'organization.Business',
+        on_delete=models.CASCADE,
+        related_name='payroll_schedule_history',
+        verbose_name=_('Business')
+    )
+    centre = models.ForeignKey(
+        'organization.Branch',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name=_('Centre / Branch')
+    )
+    employee = models.ForeignKey(
+        'organization.Employee',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name=_('Employee')
+    )
+    scope = models.CharField(max_length=20, verbose_name=_('Scope'))
+    snapshot = models.JSONField(default=dict, verbose_name=_('Configuration Snapshot'))
+    effective_from = models.DateField(verbose_name=_('Effective From Date'))
+    effective_to = models.DateField(null=True, blank=True, verbose_name=_('Effective To Date'))
+    change_reason = models.TextField(blank=True, verbose_name=_('Change Reason'))
+    changed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name=_('Changed By')
+    )
+
+    class Meta:
+        verbose_name = _('Payroll Schedule History')
+        verbose_name_plural = _('Payroll Schedule History Records')
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"History for {self.config.id} [{self.scope}] at {self.created_at}"
+

@@ -22,6 +22,12 @@ DEFAULT_MANAGER_PERMITTED = {
     'working_hours.view',
     'reports.view',
     'reports.export',
+    'meetings.view',
+    'meetings.create',
+    'meetings.edit_own',
+    'meetings.cancel_own',
+    'meetings.invite_internal',
+    'meetings.manage_participants',
 }
 
 # Standard permissions for Staff/Employees (Self-scoped)
@@ -34,6 +40,7 @@ DEFAULT_STAFF_PERMITTED = {
     'salary.view',
     'holidays.view',
     'working_hours.view',
+    'meetings.view',
 }
 
 
