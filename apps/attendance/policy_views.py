@@ -109,6 +109,10 @@ class CentreAttendancePolicyView(views.APIView):
 
         override = PolicyResolver.save_centre_override(centre=centre, override_data=request.data, user=request.user)
 
+        # Synchronize inheriting employees in this centre
+        from apps.attendance.services.employee_working_hours_service import EmployeeWorkingHoursService
+        EmployeeWorkingHoursService.sync_centre_policy_change(centre)
+
         AuditService.log(
             user_or_request=request,
             action='UPDATE_CENTRE_ATTENDANCE_OVERRIDE',
@@ -150,6 +154,10 @@ class CentreAttendancePolicyResetView(views.APIView):
         field_name = request.data.get('field') or request.data.get('field_name')
         PolicyResolver.reset_centre_override(centre=centre, user=request.user, field_name=field_name)
 
+        # Synchronize inheriting employees in this centre
+        from apps.attendance.services.employee_working_hours_service import EmployeeWorkingHoursService
+        EmployeeWorkingHoursService.sync_centre_policy_change(centre)
+
         AuditService.log(
             user_or_request=request,
             action='RESET_CENTRE_ATTENDANCE_OVERRIDE',
@@ -169,12 +177,12 @@ class CentreAttendancePolicyResetView(views.APIView):
 
 class EmployeeWorkingHoursView(views.APIView):
     """
-    Returns effective working hours and schedule configuration for an employee,
-    with explicit configuration provenance (Enterprise Default vs Centre Override vs Employee Specific).
+    Returns and manages employee-specific 7-day working hours schedule,
+    with explicit inheritance/override provenance and atomic updating.
     """
     permission_classes = [IsAuthenticated]
 
-    def get(self, request, pk):
+    def _get_employee(self, request, pk):
         from apps.organization.models import Employee
         emp = Employee.objects.filter(id=pk).select_related('business', 'branch').first()
         if not emp:
@@ -184,60 +192,68 @@ class EmployeeWorkingHoursView(views.APIView):
         if not ctx['is_superadmin'] and emp.business_id != ctx['business'].id:
             raise PermissionDenied('Cross-tenant access forbidden.')
 
+        return emp, ctx
+
+    def _can_manage(self, request, emp, ctx):
+        if ctx['is_superadmin']:
+            return True
+        if ctx['role'] == BusinessRole.BUSINESS_ADMIN:
+            return True
+        if ctx['role'] == BusinessRole.MANAGER:
+            mgr_emp = ctx.get('employee')
+            if mgr_emp and mgr_emp.branch_id and emp.branch_id != mgr_emp.branch_id:
+                return False
+            return PermissionService.has_permission(
+                user=request.user,
+                permission_key='employees.edit',
+                business=emp.business,
+                centre=emp.branch,
+                target_employee=emp
+            )
+        return False
+
+    def get(self, request, pk):
+        emp, ctx = self._get_employee(request, pk)
+        from apps.attendance.services.employee_working_hours_service import EmployeeWorkingHoursService
+        schedule_data = EmployeeWorkingHoursService.get_or_initialize_schedule(emp)
+
         centre = emp.branch
         biz = emp.business
         policy_data = PolicyResolver.get_attendance_policy(centre=centre, business=biz, user=request.user)
-
-        # Check if employee has a specific schedule assignment
-        from apps.attendance.models import EmployeeScheduleAssignment
-        assignment = EmployeeScheduleAssignment.objects.filter(
-            employee=emp,
-            effective_to__isnull=True
-        ).select_related('schedule').order_by('-effective_from').first()
-
         effective = policy_data.get('effective', {})
-        source_dict = policy_data.get('source', {})
-
-        # Determine overall configuration source
-        has_centre_override = centre and any(src == 'center' for src in source_dict.values())
-        if assignment:
-            config_source = 'Employee Custom Schedule'
-            source_badge = 'Employee Specific'
-        elif has_centre_override:
-            config_source = f"Centre Policy ({centre.name})"
-            source_badge = 'Inherited from Centre'
-        elif centre:
-            config_source = f"Enterprise Default (inherited by {centre.name})"
-            source_badge = 'Inherited from Enterprise'
-        else:
-            config_source = "Enterprise Default Policy"
-            source_badge = 'Inherited from Enterprise'
 
         # Map day numbers to names
         day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-        weekly_off_days_indices = effective.get('weekly_off_days') or [6]
-        weekly_off_names = [day_names[i] for i in weekly_off_days_indices if 0 <= i < 7]
+
+        # Derive employee-specific schedule metrics from the 7-day records
+        emp_days = schedule_data.get('days', [])
+        enabled_days = [d for d in emp_days if d.get('is_enabled')]
+        off_day_names = [d['day_name'] for d in emp_days if not d.get('is_enabled')]
+        working_days_count = len(enabled_days) if emp_days else effective.get('working_days', 5)
+        weekly_off_names = off_day_names if emp_days else [day_names[i] for i in (effective.get('weekly_off_days') or [6]) if 0 <= i < 7]
+
+        # Shift timings from the first active working day, or policy fallback
+        first_enabled = enabled_days[0] if enabled_days else None
+        shift_timings = {
+            'office_start': (first_enabled.get('start_time') if first_enabled else None) or effective.get('office_start', '09:00'),
+            'office_end': (first_enabled.get('end_time') if first_enabled else None) or effective.get('office_end', '18:00'),
+            'break_start': (first_enabled.get('break_start') if first_enabled else None) or effective.get('break_start', '13:00'),
+            'break_end': (first_enabled.get('break_end') if first_enabled else None) or effective.get('break_end', '14:00'),
+        }
+
+        can_edit = self._can_manage(request, emp, ctx)
 
         return Response({
-            'employee_id': str(emp.id),
-            'employee_name': emp.full_name,
-            'centre_id': str(centre.id) if centre else None,
-            'centre_name': centre.name if centre else 'Unassigned Centre',
-            'configuration_source': config_source,
-            'source_badge': source_badge,
-            'shift_timings': {
-                'office_start': effective.get('office_start', '09:00'),
-                'office_end': effective.get('office_end', '18:00'),
-                'break_start': effective.get('break_start', '13:00'),
-                'break_end': effective.get('break_end', '14:00'),
-            },
+            **schedule_data,
+            'can_edit': can_edit,
+            'shift_timings': shift_timings,
             'rules': {
                 'grace_period_minutes': effective.get('grace_period_minutes', 15),
                 'minimum_present_minutes': effective.get('minimum_present_minutes', 480),
                 'minimum_half_day_minutes': effective.get('minimum_half_day_minutes', 240),
                 'late_threshold_minutes': effective.get('late_threshold_minutes', 30),
                 'early_checkout_threshold_minutes': effective.get('early_checkout_threshold_minutes', 30),
-                'working_days_per_week': effective.get('working_days', 5),
+                'working_days_per_week': working_days_count,
                 'weekly_off_days': weekly_off_names,
                 'ot_enabled': effective.get('ot_enabled', False),
                 'ot_grace_minutes': effective.get('ot_grace_minutes', 30),
@@ -252,5 +268,72 @@ class EmployeeWorkingHoursView(views.APIView):
                 'biometric': effective.get('allow_biometric', False),
             },
             'effective': effective,
-            'source': source_dict
         })
+
+    def put(self, request, pk):
+        emp, ctx = self._get_employee(request, pk)
+        if not self._can_manage(request, emp, ctx):
+            raise PermissionDenied('You do not have permission to modify employee working hours.')
+
+        from apps.attendance.services.employee_working_hours_service import EmployeeWorkingHoursService
+
+        action = request.data.get('action')
+        is_override = request.data.get('is_override')
+
+        if action == 'reset' or is_override is False:
+            EmployeeWorkingHoursService.reset_schedule_to_centre(emp, user=request.user)
+        elif 'days' in request.data:
+            EmployeeWorkingHoursService.update_employee_schedule(
+                employee=emp,
+                days_data=request.data['days'],
+                user=request.user,
+                reason=request.data.get('reason')
+            )
+        else:
+            raise ValidationError({'detail': 'Either days list or reset action is required.'})
+
+        return self.get(request, pk)
+
+    def patch(self, request, pk):
+        return self.put(request, pk)
+
+
+class EmployeeWorkingHoursResetView(views.APIView):
+    """
+    Explicit endpoint to reset an employee's working hours to inherit the centre's effective policy.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        from apps.organization.models import Employee
+        emp = Employee.objects.filter(id=pk).select_related('business', 'branch').first()
+        if not emp:
+            raise NotFound('Employee not found.')
+
+        ctx = get_user_context(request)
+        if not ctx['is_superadmin'] and emp.business_id != ctx['business'].id:
+            raise PermissionDenied('Cross-tenant access forbidden.')
+
+        can_edit = False
+        if ctx['is_superadmin'] or ctx['role'] == BusinessRole.BUSINESS_ADMIN:
+            can_edit = True
+        elif ctx['role'] == BusinessRole.MANAGER:
+            mgr_emp = ctx.get('employee')
+            if not (mgr_emp and mgr_emp.branch_id and emp.branch_id != mgr_emp.branch_id):
+                can_edit = PermissionService.has_permission(
+                    user=request.user,
+                    permission_key='employees.edit',
+                    business=emp.business,
+                    centre=emp.branch,
+                    target_employee=emp
+                )
+
+        if not can_edit:
+            raise PermissionDenied('You do not have permission to reset employee working hours.')
+
+        from apps.attendance.services.employee_working_hours_service import EmployeeWorkingHoursService
+        EmployeeWorkingHoursService.reset_schedule_to_centre(emp, user=request.user)
+
+        resp = EmployeeWorkingHoursView().get(request, pk)
+        resp.data['detail'] = f"Working hours reset to centre defaults for {emp.full_name}."
+        return resp

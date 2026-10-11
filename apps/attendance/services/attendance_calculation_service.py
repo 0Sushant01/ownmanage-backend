@@ -37,24 +37,40 @@ class AttendanceCalculationService:
         ot_enabled = bool(policy.get('ot_enabled', False))
         ot_grace = int(policy.get('ot_grace_minutes', 30))
 
-        # Check for daily schedules override for day-of-week
+        # Resolve employee working hours or fallback to centre/enterprise policy
         weekday_idx = day.attendance_date.weekday()
-        weekday_key = str(weekday_idx)
-        daily_schedules = policy.get('daily_schedules') or {}
-        if weekday_key in daily_schedules and isinstance(daily_schedules[weekday_key], dict):
-            sched = daily_schedules[weekday_key]
-            if sched.get('start'):
-                office_start_str = sched['start']
-            if sched.get('end'):
-                office_end_str = sched['end']
+        emp_wh = None
+        if day.employee_id:
+            try:
+                emp_wh = day.employee.working_hours.filter(day_of_week=weekday_idx).first()
+            except Exception:
+                emp_wh = None
 
-        # Check for weekly off days (supports 0 to 7 days: e.g. [], [6], [0, 6], etc.)
-        weekly_off_days = policy.get('weekly_off_days')
-        if weekly_off_days is not None and isinstance(weekly_off_days, list):
-            is_weekly_off = weekday_idx in [int(x) for x in weekly_off_days]
+        if emp_wh:
+            is_weekly_off = not emp_wh.is_enabled
+            if emp_wh.is_enabled:
+                if emp_wh.start_time:
+                    office_start_str = emp_wh.start_time.strftime('%H:%M')
+                if emp_wh.end_time:
+                    office_end_str = emp_wh.end_time.strftime('%H:%M')
         else:
-            weekly_off_day = int(policy.get('weekly_off', 6))
-            is_weekly_off = (weekday_idx == weekly_off_day)
+            # Check for daily schedules override for day-of-week in policy
+            weekday_key = str(weekday_idx)
+            daily_schedules = policy.get('daily_schedules') or {}
+            if weekday_key in daily_schedules and isinstance(daily_schedules[weekday_key], dict):
+                sched = daily_schedules[weekday_key]
+                if sched.get('start'):
+                    office_start_str = sched['start']
+                if sched.get('end'):
+                    office_end_str = sched['end']
+
+            # Check for weekly off days (supports 0 to 7 days: e.g. [], [6], [0, 6], etc.)
+            weekly_off_days = policy.get('weekly_off_days')
+            if weekly_off_days is not None and isinstance(weekly_off_days, list):
+                is_weekly_off = weekday_idx in [int(x) for x in weekly_off_days]
+            else:
+                weekly_off_day = int(policy.get('weekly_off', 6))
+                is_weekly_off = (weekday_idx == weekly_off_day)
 
         # Resolve local timezone (Centre priority, then Enterprise, then Asia/Kolkata)
         tz_name = (centre.timezone if centre and getattr(centre, 'timezone', None) else (business.timezone if business and business.timezone else 'Asia/Kolkata'))
@@ -248,22 +264,33 @@ def calculate_attendance_status(
     centre: Optional[Any],
     date: Any,
     check_in_time: Optional[datetime] = None,
-    check_out_time: Optional[datetime] = None
+    check_out_time: Optional[datetime] = None,
+    employee: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Computes attendance status for a given centre, date, and check-in/out times.
-    Supports weekly off days (0 to 7 days), grace period, and shift boundaries.
+    Supports weekly off days (0 to 7 days), grace period, shift boundaries, and employee-specific working hours.
     """
     policy_data = PolicyResolver.get_attendance_policy(centre=centre)
     policy = policy_data['effective']
 
     weekday_idx = date.weekday()
-    weekly_off_days = policy.get('weekly_off_days')
-    if weekly_off_days is not None and isinstance(weekly_off_days, list):
-        is_weekly_off = weekday_idx in [int(x) for x in weekly_off_days]
+    emp_wh = None
+    if employee and hasattr(employee, 'working_hours'):
+        try:
+            emp_wh = employee.working_hours.filter(day_of_week=weekday_idx).first()
+        except Exception:
+            emp_wh = None
+
+    if emp_wh:
+        is_weekly_off = not emp_wh.is_enabled
     else:
-        weekly_off_day = int(policy.get('weekly_off', 6))
-        is_weekly_off = (weekday_idx == weekly_off_day)
+        weekly_off_days = policy.get('weekly_off_days')
+        if weekly_off_days is not None and isinstance(weekly_off_days, list):
+            is_weekly_off = weekday_idx in [int(x) for x in weekly_off_days]
+        else:
+            weekly_off_day = int(policy.get('weekly_off', 6))
+            is_weekly_off = (weekday_idx == weekly_off_day)
 
     if not check_in_time:
         status = AttendanceStatus.WEEK_OFF if is_weekly_off else AttendanceStatus.ABSENT
@@ -276,6 +303,8 @@ def calculate_attendance_status(
         }
 
     office_start_str = policy.get('office_start', '09:00')
+    if emp_wh and emp_wh.is_enabled and emp_wh.start_time:
+        office_start_str = emp_wh.start_time.strftime('%H:%M')
     grace_period = int(policy.get('grace_period_minutes', 15))
     min_present = int(policy.get('minimum_present_minutes', 480))
     min_half_day = int(policy.get('minimum_half_day_minutes', 240))

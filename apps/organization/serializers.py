@@ -319,6 +319,10 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
                 notes='Initial assignment on joining'
             )
 
+            # Initialize 7 weekday working-hours records atomically from centre policy
+            from apps.attendance.services.employee_working_hours_service import EmployeeWorkingHoursService
+            EmployeeWorkingHoursService.initialize_employee_schedule(employee)
+
             return employee
 
 

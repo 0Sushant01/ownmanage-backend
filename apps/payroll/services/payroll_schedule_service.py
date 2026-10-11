@@ -1,5 +1,5 @@
 import calendar
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from django.db import transaction
 from django.utils import timezone
@@ -9,13 +9,16 @@ from apps.core.services.audit_service import AuditService
 from apps.organization.models import Business, Branch, Employee
 from apps.payroll.models import (
     PayrollScheduleConfig, PayrollScheduleHistory, ScheduleConfigScope,
-    CompensationType, PayFrequency, MonthEndRule,
+    CompensationType, PayFrequency, GenerationType, MonthEndRule,
     PayrollGenerationMode, PaymentScheduleRule,
     PayrollRun, PayrollRunStatus, PayrollStatus
 )
 
 
 SYSTEM_DEFAULT_SCHEDULE: Dict[str, Any] = {
+    'generation_type': GenerationType.MONTHLY,
+    'generation_weekday': 0,  # Monday
+    'generation_day_of_month': 1,
     'compensation_type': CompensationType.MONTHLY_SALARY,
     'pay_frequency': PayFrequency.MONTHLY_CALENDAR,
     'week_start_day': 0,  # Monday
@@ -24,10 +27,13 @@ SYSTEM_DEFAULT_SCHEDULE: Dict[str, Any] = {
     'month_end_rule': MonthEndRule.CLAMP_TO_LAST_DAY,
     'generation_mode': PayrollGenerationMode.MANUAL,
     'generation_delay_days': 1,
-    'generation_day_of_month': 1,
     'approval_required': True,
     'approver_role': 'BUSINESS_ADMIN',
     'review_deadline_days': 3,
+    'editable_period_duration': 3,
+    'editing_period_unit': 'DAYS',
+    'finalization_deadline_days': 3,
+    'visibility_policy': 'ON_FINALIZATION',
     'payment_rule': PaymentScheduleRule.DAY_OF_FOLLOWING_MONTH,
     'payment_offset_days': 5,
     'payment_day_of_month': 7,
@@ -37,10 +43,13 @@ SYSTEM_DEFAULT_SCHEDULE: Dict[str, Any] = {
 
 class PayrollScheduleService:
     CONFIG_FIELDS = [
+        'generation_type', 'generation_weekday', 'generation_day_of_month',
         'compensation_type', 'pay_frequency', 'week_start_day',
         'custom_cycle_start_day', 'anchor_date', 'month_end_rule',
-        'generation_mode', 'generation_delay_days', 'generation_day_of_month',
+        'generation_mode', 'generation_delay_days',
         'approval_required', 'approver_role', 'review_deadline_days',
+        'editable_period_duration', 'editing_period_unit',
+        'finalization_deadline_days', 'visibility_policy',
         'payment_rule', 'payment_offset_days', 'payment_day_of_month', 'payment_weekday',
         'effective_from', 'effective_to', 'change_reason'
     ]
@@ -59,6 +68,14 @@ class PayrollScheduleService:
             'change_reason': obj.change_reason or '',
             'changed_by_name': obj.changed_by.get_full_name() or obj.changed_by.email if obj.changed_by else None,
             'updated_at': obj.updated_at.isoformat() if obj.updated_at else None,
+            'generation_type': getattr(obj, 'generation_type', None) or (
+                GenerationType.DAILY if obj.pay_frequency == PayFrequency.DAILY else (
+                    GenerationType.WEEKLY if obj.pay_frequency == PayFrequency.WEEKLY else GenerationType.MONTHLY
+                )
+            ),
+            'generation_weekday': getattr(obj, 'generation_weekday', 0) if getattr(obj, 'generation_weekday', None) is not None else (obj.week_start_day or 0),
+            'generation_day_of_month': obj.generation_day_of_month or 1,
+            'generation_date': obj.generation_day_of_month or 1,
             'compensation_type': obj.compensation_type,
             'pay_frequency': obj.pay_frequency,
             'week_start_day': obj.week_start_day,
@@ -67,10 +84,13 @@ class PayrollScheduleService:
             'month_end_rule': obj.month_end_rule,
             'generation_mode': obj.generation_mode,
             'generation_delay_days': obj.generation_delay_days,
-            'generation_day_of_month': obj.generation_day_of_month,
             'approval_required': obj.approval_required,
             'approver_role': obj.approver_role,
             'review_deadline_days': obj.review_deadline_days,
+            'editable_period_duration': getattr(obj, 'editable_period_duration', 3),
+            'editing_period_unit': getattr(obj, 'editing_period_unit', 'DAYS'),
+            'finalization_deadline_days': getattr(obj, 'finalization_deadline_days', 3),
+            'visibility_policy': getattr(obj, 'visibility_policy', 'ON_FINALIZATION'),
             'payment_rule': obj.payment_rule,
             'payment_offset_days': obj.payment_offset_days,
             'payment_day_of_month': obj.payment_day_of_month,
@@ -134,7 +154,7 @@ class PayrollScheduleService:
             for field in cls.CONFIG_FIELDS:
                 val = getattr(ent_cfg, field, None)
                 if val is not None:
-                    resolved[field] = val
+                    resolved[field] = str(val) if isinstance(val, (date, datetime)) else val
 
         if cen_cfg and cen_cfg.has_override:
             source = 'CENTRE'
@@ -143,7 +163,7 @@ class PayrollScheduleService:
             for field in cls.CONFIG_FIELDS:
                 val = getattr(cen_cfg, field, None)
                 if val is not None:
-                    resolved[field] = val
+                    resolved[field] = str(val) if isinstance(val, (date, datetime)) else val
 
         if emp_cfg and emp_cfg.has_override:
             source = 'EMPLOYEE'
@@ -152,7 +172,22 @@ class PayrollScheduleService:
             for field in cls.CONFIG_FIELDS:
                 val = getattr(emp_cfg, field, None)
                 if val is not None:
-                    resolved[field] = val
+                    resolved[field] = str(val) if isinstance(val, (date, datetime)) else val
+
+        # Guarantee generation_type consistency across hierarchy
+        g_type = resolved.get('generation_type')
+        if not g_type:
+            pf = resolved.get('pay_frequency')
+            if pf == PayFrequency.DAILY:
+                g_type = GenerationType.DAILY
+            elif pf == PayFrequency.WEEKLY:
+                g_type = GenerationType.WEEKLY
+            else:
+                g_type = GenerationType.MONTHLY
+        resolved['generation_type'] = g_type
+        resolved['generation_weekday'] = int(resolved.get('generation_weekday') if resolved.get('generation_weekday') is not None else resolved.get('week_start_day', 0))
+        resolved['generation_date'] = int(resolved.get('generation_day_of_month') or 1)
+        resolved['generation_day_of_month'] = resolved['generation_date']
 
         # Compute calculated current period & payment date
         p_start, p_end = cls.calculate_period_boundaries(resolved)
@@ -198,13 +233,14 @@ class PayrollScheduleService:
         Guarantees zero overlapping or missing days.
         """
         ref = ref_date or timezone.now().date()
+        gen_type = config.get('generation_type')
         freq = config.get('pay_frequency') or PayFrequency.MONTHLY_CALENDAR
 
-        if freq == PayFrequency.DAILY:
+        if gen_type == GenerationType.DAILY or freq == PayFrequency.DAILY:
             return ref, ref
 
-        if freq == PayFrequency.WEEKLY:
-            start_day = int(config.get('week_start_day', 0))
+        if gen_type == GenerationType.WEEKLY or freq == PayFrequency.WEEKLY:
+            start_day = int(config.get('generation_weekday') if config.get('generation_weekday') is not None else config.get('week_start_day', 0))
             delta = (ref.weekday() - start_day) % 7
             p_start = ref - timedelta(days=delta)
             p_end = p_start + timedelta(days=6)
@@ -270,6 +306,48 @@ class PayrollScheduleService:
         # Default: MONTHLY_CALENDAR or fallback
         last_day = calendar.monthrange(ref.year, ref.month)[1]
         return date(ref.year, ref.month, 1), date(ref.year, ref.month, last_day)
+
+    @classmethod
+    def get_effective_monthly_generation_date(cls, year: int, month: int, configured_day: int) -> date:
+        """
+        Deterministic month-end rule: Clamps configured_day (1-31) to actual last day of month.
+        e.g., 31 in Feb 2026 -> 2026-02-28; 31 in Feb 2028 (leap year) -> 2028-02-29; 31 in April -> 2026-04-30.
+        """
+        last_day = calendar.monthrange(year, month)[1]
+        day = min(max(1, int(configured_day or 1)), last_day)
+        return date(year, month, day)
+
+    @classmethod
+    def get_completed_weekly_period(cls, generation_weekday: int, ref_date: Optional[date] = None) -> Tuple[date, date]:
+        """
+        Calculates the completed 7-day weekly period that completed on or before the generation weekday.
+        If generation day is Monday (0), completed week is preceding Monday to Sunday (ending yesterday).
+        Guarantees non-overlapping, contiguous 7-day boundaries.
+        """
+        ref = ref_date or timezone.now().date()
+        gen_day = int(generation_weekday or 0)
+        delta = (ref.weekday() - gen_day) % 7
+        most_recent_gen_date = ref - timedelta(days=delta)
+        completed_end = most_recent_gen_date - timedelta(days=1)
+        completed_start = completed_end - timedelta(days=6)
+        return completed_start, completed_end
+
+    @classmethod
+    def calculate_editing_deadline(
+        cls,
+        config: Dict[str, Any],
+        reference_dt=None
+    ):
+        """
+        Calculates the exact timestamp when editing for a payroll run closes.
+        Based on editable_period_duration and editing_period_unit ('DAYS' or 'HOURS').
+        """
+        ref = reference_dt or timezone.now()
+        duration = int(config.get('editable_period_duration', 3))
+        unit = str(config.get('editing_period_unit', 'DAYS')).upper()
+        if unit == 'HOURS':
+            return ref + timedelta(hours=duration)
+        return ref + timedelta(days=duration)
 
     @classmethod
     def calculate_expected_payment_date(
@@ -364,6 +442,58 @@ class PayrollScheduleService:
         data = data or {}
         reason = reason or data.get('change_reason') or 'Updated payroll schedule configuration'
 
+        # Determine and validate generation_type (Support exactly DAILY, WEEKLY, MONTHLY)
+        gen_type = data.get('generation_type')
+        if not gen_type:
+            pf = data.get('pay_frequency')
+            if pf in [PayFrequency.DAILY, 'DAILY']:
+                gen_type = GenerationType.DAILY
+            elif pf in [PayFrequency.WEEKLY, 'WEEKLY']:
+                gen_type = GenerationType.WEEKLY
+            else:
+                gen_type = GenerationType.MONTHLY
+
+        if gen_type not in [GenerationType.DAILY, GenerationType.WEEKLY, GenerationType.MONTHLY]:
+            raise ValidationError(f'Invalid generation type "{gen_type}". Must be DAILY, WEEKLY, or MONTHLY.')
+
+        # Strict validation per generation type
+        if gen_type == GenerationType.WEEKLY:
+            gen_weekday = data.get('generation_weekday')
+            if gen_weekday is None:
+                gen_weekday = data.get('week_start_day', 0)
+            try:
+                gen_weekday = int(gen_weekday)
+                if not (0 <= gen_weekday <= 6):
+                    raise ValueError()
+            except (ValueError, TypeError):
+                raise ValidationError({'generation_weekday': 'Generation weekday must be between 0 (Monday) and 6 (Sunday).'})
+            data['generation_weekday'] = gen_weekday
+            data['week_start_day'] = gen_weekday
+            data['pay_frequency'] = PayFrequency.WEEKLY
+
+        elif gen_type == GenerationType.MONTHLY:
+            gen_date = data.get('generation_date') or data.get('generation_day_of_month', 1)
+            try:
+                gen_date = int(gen_date)
+                if not (1 <= gen_date <= 31):
+                    raise ValueError()
+            except (ValueError, TypeError):
+                raise ValidationError({'generation_date': 'Generation date must be between 1 and 31.'})
+            data['generation_day_of_month'] = gen_date
+            data['pay_frequency'] = PayFrequency.MONTHLY_CALENDAR
+
+        elif gen_type == GenerationType.DAILY:
+            data['pay_frequency'] = PayFrequency.DAILY
+            data['generation_weekday'] = 0
+            data['generation_day_of_month'] = 1
+            if employee:
+                current_sched = cls.resolve_schedule(employee=employee)
+                emp_comp_type = data.get('compensation_type') or current_sched['effective_config'].get('compensation_type')
+                if emp_comp_type == CompensationType.FIXED_CONTRACT:
+                    raise ValidationError('Daily salary slip generation is not supported for Fixed Contract compensation.')
+
+        data['generation_type'] = gen_type
+
         with transaction.atomic():
             # Lookup active config
             filter_kwargs = {
@@ -406,10 +536,13 @@ class PayrollScheduleService:
             }
 
             field_keys = [
+                'generation_type', 'generation_weekday', 'generation_day_of_month',
                 'compensation_type', 'pay_frequency', 'week_start_day',
                 'custom_cycle_start_day', 'anchor_date', 'month_end_rule',
-                'generation_mode', 'generation_delay_days', 'generation_day_of_month',
+                'generation_mode', 'generation_delay_days',
                 'approval_required', 'approver_role', 'review_deadline_days',
+                'editable_period_duration', 'editing_period_unit',
+                'finalization_deadline_days', 'visibility_policy',
                 'payment_rule', 'payment_offset_days', 'payment_day_of_month', 'payment_weekday',
                 'effective_from'
             ]
@@ -542,11 +675,39 @@ class PayrollScheduleService:
             ent_schedule = cls.resolve_schedule(business=biz)
             cfg = ent_schedule['effective_config']
             mode = cfg.get('generation_mode')
+            gen_type = cfg.get('generation_type') or GenerationType.MONTHLY
 
-            if mode in [PayrollGenerationMode.AUTOMATIC_DRAFT_AFTER_PERIOD_END, PayrollGenerationMode.AUTOMATIC_DRAFT_ON_CONFIGURED_DATE]:
+            should_run = False
+            p_start, p_end = None, None
+
+            if gen_type == GenerationType.DAILY:
+                # Daily draft generation for completed yesterday
+                yesterday = today - timedelta(days=1)
+                p_start, p_end = yesterday, yesterday
+                should_run = True
+
+            elif gen_type == GenerationType.WEEKLY:
+                target_weekday = int(cfg.get('generation_weekday', 0))
+                if today.weekday() == target_weekday:
+                    p_start, p_end = cls.get_completed_weekly_period(target_weekday, today)
+                    should_run = True
+
+            elif gen_type == GenerationType.MONTHLY:
+                gen_date_cfg = int(cfg.get('generation_day_of_month') or 1)
+                eff_gen_date = cls.get_effective_monthly_generation_date(today.year, today.month, gen_date_cfg)
+                if today >= eff_gen_date:
+                    # Completed period is previous calendar month
+                    if today.month == 1:
+                        py, pm = today.year - 1, 12
+                    else:
+                        py, pm = today.year, today.month - 1
+                    last_day = calendar.monthrange(py, pm)[1]
+                    p_start, p_end = date(py, pm, 1), date(py, pm, last_day)
+                    should_run = True
+
+            # Also check legacy generation mode triggers if not handled above
+            if not should_run and mode in [PayrollGenerationMode.AUTOMATIC_DRAFT_AFTER_PERIOD_END, PayrollGenerationMode.AUTOMATIC_DRAFT_ON_CONFIGURED_DATE]:
                 p_start, p_end = cls.calculate_period_boundaries(cfg, today)
-
-                should_run = False
                 if mode == PayrollGenerationMode.AUTOMATIC_DRAFT_AFTER_PERIOD_END:
                     delay = int(cfg.get('generation_delay_days', 1))
                     if today >= (p_end + timedelta(days=delay)):
@@ -556,29 +717,29 @@ class PayrollScheduleService:
                     if today.day >= gen_day:
                         should_run = True
 
-                if should_run:
-                    # Prevent duplicate or overwrite of finalized
-                    existing_run = PayrollRun.objects.filter(
-                        business=biz,
-                        centre__isnull=True,
-                        period_start=p_start,
-                        period_end=p_end
-                    ).first()
+            if should_run and p_start and p_end:
+                # Prevent duplicate or overwrite of finalized
+                existing_run = PayrollRun.objects.filter(
+                    business=biz,
+                    centre__isnull=True,
+                    period_start=p_start,
+                    period_end=p_end
+                ).first()
 
-                    if not existing_run:
-                        exp_payment = cls.calculate_expected_payment_date(p_end, cfg)
-                        run = PayrollCalculationService.run_batch_payroll(
-                            business=biz,
-                            period_start=p_start,
-                            period_end=p_end,
-                            centre=None,
-                            approved_by=None
-                        )
-                        run.status = PayrollRunStatus.DRAFT
-                        run.generation_mode = mode
-                        run.pay_frequency = cfg.get('pay_frequency', PayFrequency.MONTHLY_CALENDAR)
-                        run.expected_payment_date = exp_payment
-                        run.save(update_fields=['status', 'generation_mode', 'pay_frequency', 'expected_payment_date', 'updated_at'])
-                        generated_runs.append(run)
+                if not existing_run:
+                    exp_payment = cls.calculate_expected_payment_date(p_end, cfg)
+                    run = PayrollCalculationService.run_batch_payroll(
+                        business=biz,
+                        period_start=p_start,
+                        period_end=p_end,
+                        centre=None,
+                        approved_by=None
+                    )
+                    run.status = PayrollRunStatus.DRAFT
+                    run.generation_mode = mode or PayrollGenerationMode.MANUAL
+                    run.pay_frequency = cfg.get('pay_frequency', PayFrequency.MONTHLY_CALENDAR)
+                    run.expected_payment_date = exp_payment
+                    run.save(update_fields=['status', 'generation_mode', 'pay_frequency', 'expected_payment_date', 'updated_at'])
+                    generated_runs.append(run)
 
         return generated_runs

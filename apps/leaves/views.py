@@ -144,3 +144,72 @@ class LeaveRequestRejectView(views.APIView):
             'detail': 'Leave request rejected.',
             'leave_request': LeaveRequestSerializer(leave_req).data
         })
+
+
+class LeaveRequestStatusUpdateView(views.APIView):
+    """
+    Inline status update endpoint for Leave Requests.
+    Allows authorized administrators and managers to update status to PENDING, APPROVED, or REJECTED.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, pk):
+        ctx = get_user_context(request)
+        leave_req = LeaveRequest.objects.filter(id=pk).select_related('employee', 'business').first()
+        if not leave_req:
+            raise NotFound('Leave request not found.')
+
+        from apps.organization.services.permission_service import PermissionService
+        can_manage = (
+            ctx['is_superadmin'] or
+            ctx['role'] == BusinessRole.BUSINESS_ADMIN or
+            PermissionService.has_permission(request.user, 'leave.approve', business=leave_req.business, target_employee=leave_req.employee) or
+            PermissionService.has_permission(request.user, 'leave.reject', business=leave_req.business, target_employee=leave_req.employee)
+        )
+        if not can_manage:
+            raise PermissionDenied('You do not have permission to modify leave request status.')
+
+        # Self-approval protection
+        if leave_req.employee.user_id == request.user.id and not ctx['is_superadmin']:
+            raise PermissionDenied('You cannot modify your own leave request status.')
+
+        new_status = request.data.get('status')
+        if not new_status or new_status not in [LeaveRequestStatus.PENDING, LeaveRequestStatus.APPROVED, LeaveRequestStatus.REJECTED]:
+            raise ValidationError({'detail': 'Invalid status. Choose PENDING, APPROVED, or REJECTED.'})
+
+        old_status = leave_req.status
+        leave_req.status = new_status
+        if new_status == LeaveRequestStatus.APPROVED:
+            leave_req.approved_by = request.user
+            leave_req.approved_at = timezone.now()
+            leave_req.rejected_at = None
+        elif new_status == LeaveRequestStatus.REJECTED:
+            leave_req.approved_by = request.user
+            leave_req.rejected_at = timezone.now()
+            leave_req.rejection_reason = request.data.get('reason', '')
+        elif new_status == LeaveRequestStatus.PENDING:
+            leave_req.approved_by = None
+            leave_req.approved_at = None
+            leave_req.rejected_at = None
+            leave_req.rejection_reason = ''
+
+        leave_req.save()
+
+        # Audit log
+        from apps.core.services.audit_service import AuditService
+        AuditService.log(
+            user_or_request=request,
+            action='UPDATE_LEAVE_STATUS',
+            entity_type='LeaveRequest',
+            entity_id=str(leave_req.id),
+            old_data={'status': old_status},
+            new_data={'status': new_status},
+            business=leave_req.business,
+            reason=f'Updated leave request status: {old_status} → {new_status}'
+        )
+
+        return Response({
+            'detail': f'Leave request status updated to {new_status}.',
+            'leave_request': LeaveRequestSerializer(leave_req).data
+        })
+

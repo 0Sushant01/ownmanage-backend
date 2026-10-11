@@ -439,6 +439,7 @@ class EmployeeDetailView(views.APIView):
         if not PermissionService.has_permission(request.user, 'employees.edit', business=emp.business, target_employee=emp):
             raise PermissionDenied('You do not have permission to edit employee records.')
 
+        old_branch_id = emp.branch_id
         old_branch_name = emp.branch.name if emp.branch else 'None'
         old_mgr_name = emp.manager.full_name if emp.manager else 'None'
         old_status = emp.employment_status
@@ -448,7 +449,7 @@ class EmployeeDetailView(views.APIView):
         updated_emp = serializer.save()
 
         from apps.organization.models import EmployeeActivityLog
-        if 'branch' in request.data and updated_emp.branch != emp.branch:
+        if ('branch' in request.data or 'branch_id' in request.data) and updated_emp.branch_id != old_branch_id:
             new_branch_name = updated_emp.branch.name if updated_emp.branch else 'None'
             EmployeeActivityLog.objects.create(
                 business=emp.business,
@@ -459,6 +460,8 @@ class EmployeeDetailView(views.APIView):
                 new_value={'branch': new_branch_name},
                 performed_by=request.user
             )
+            from apps.attendance.services.employee_working_hours_service import EmployeeWorkingHoursService
+            EmployeeWorkingHoursService.sync_employee_centre_change(updated_emp, updated_emp.branch)
 
         if 'manager' in request.data and updated_emp.manager != emp.manager:
             new_mgr_name = updated_emp.manager.full_name if updated_emp.manager else 'None'

@@ -22,6 +22,12 @@ class PayFrequency(models.TextChoices):
     CUSTOM_PERIOD = 'CUSTOM_PERIOD', _('Custom Period')
 
 
+class GenerationType(models.TextChoices):
+    DAILY = 'DAILY', _('Daily')
+    WEEKLY = 'WEEKLY', _('Weekly')
+    MONTHLY = 'MONTHLY', _('Monthly')
+
+
 class MonthEndRule(models.TextChoices):
     CLAMP_TO_LAST_DAY = 'CLAMP_TO_LAST_DAY', _('Clamp to Last Day of Month')
     NEXT_AVAILABLE_DAY = 'NEXT_AVAILABLE_DAY', _('Next Available Day')
@@ -49,12 +55,25 @@ class ScheduleConfigScope(models.TextChoices):
     EMPLOYEE = 'EMPLOYEE', _('Employee Override')
 
 
+class SalarySlipVisibilityPolicy(models.TextChoices):
+    ON_FINALIZATION = 'ON_FINALIZATION', _('On Payroll Finalization')
+    ON_RELEASE = 'ON_RELEASE', _('On Explicit Release')
+    ON_PAYMENT_DATE = 'ON_PAYMENT_DATE', _('On Payment Date')
+
+
+class EditingPeriodUnit(models.TextChoices):
+    DAYS = 'DAYS', _('Days')
+    HOURS = 'HOURS', _('Hours')
+
+
 class PayrollStatus(models.TextChoices):
     """
     Lifecycle status for payroll calculation and disbursement.
     """
     DRAFT = 'DRAFT', _('Draft')
-    PROCESSED = 'PROCESSED', _('Processed')
+    PROCESSED = 'PROCESSED', _('In Review')
+    FINALIZED = 'FINALIZED', _('Finalized')
+    RELEASED = 'RELEASED', _('Released')
     PAID = 'PAID', _('Paid')
     CANCELLED = 'CANCELLED', _('Cancelled')
 
@@ -78,8 +97,10 @@ class CompensationCalculationType(models.TextChoices):
 
 
 class CompensationFrequency(models.TextChoices):
-    RECURRING = 'RECURRING', _('Recurring Monthly')
+    MONTHLY = 'MONTHLY', _('Recurring Monthly')
+    WEEKLY = 'WEEKLY', _('Recurring Weekly')
     ONE_TIME = 'ONE_TIME', _('One-Time')
+    RECURRING = 'RECURRING', _('Recurring Monthly')
 
 
 class SalaryStructure(TimeStampedUUIDModel):
@@ -222,6 +243,16 @@ class SalaryRevision(TimeStampedUUIDModel):
         default='INR',
         verbose_name=_('Currency')
     )
+    salary_unit = models.CharField(
+        max_length=20,
+        choices=[
+            ('MONTHLY', _('Per Month')),
+            ('WEEKLY', _('Per Week')),
+            ('DAILY', _('Per Day')),
+        ],
+        default='MONTHLY',
+        verbose_name=_('Salary Unit')
+    )
     allowances = models.JSONField(
         default=dict,
         blank=True,
@@ -263,6 +294,8 @@ class PayrollRunStatus(models.TextChoices):
     REVIEW = 'REVIEW', _('In Review')
     APPROVED = 'APPROVED', _('Approved')
     FINALIZED = 'FINALIZED', _('Finalized')
+    RELEASED = 'RELEASED', _('Released')
+    PAID = 'PAID', _('Paid')
     CANCELLED = 'CANCELLED', _('Cancelled')
 
 
@@ -320,6 +353,8 @@ class PayrollRun(TimeStampedUUIDModel):
         verbose_name=_('Approved By')
     )
     finalized_at = models.DateTimeField(null=True, blank=True, verbose_name=_('Finalized Timestamp'))
+    released_at = models.DateTimeField(null=True, blank=True, verbose_name=_('Released Timestamp'))
+    editing_deadline = models.DateTimeField(null=True, blank=True, verbose_name=_('Editing Deadline'))
     expected_payment_date = models.DateField(
         null=True,
         blank=True,
@@ -331,11 +366,23 @@ class PayrollRun(TimeStampedUUIDModel):
         default=PayrollGenerationMode.MANUAL,
         verbose_name=_('Generation Mode')
     )
+    generation_type = models.CharField(
+        max_length=20,
+        choices=GenerationType.choices,
+        default=GenerationType.MONTHLY,
+        verbose_name=_('Generation Frequency')
+    )
     pay_frequency = models.CharField(
         max_length=50,
         choices=PayFrequency.choices,
         default=PayFrequency.MONTHLY_CALENDAR,
         verbose_name=_('Pay Frequency')
+    )
+    visibility_policy = models.CharField(
+        max_length=30,
+        choices=SalarySlipVisibilityPolicy.choices,
+        default=SalarySlipVisibilityPolicy.ON_FINALIZATION,
+        verbose_name=_('Visibility Policy')
     )
     schedule_config = models.ForeignKey(
         'payroll.PayrollScheduleConfig',
@@ -345,6 +392,19 @@ class PayrollRun(TimeStampedUUIDModel):
         related_name='payroll_runs',
         verbose_name=_('Schedule Configuration')
     )
+    schedule_config_snapshot = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name=_('Frozen Schedule Snapshot')
+    )
+
+    @property
+    def is_editing_open(self) -> bool:
+        if self.status in [PayrollRunStatus.FINALIZED, PayrollRunStatus.RELEASED, PayrollRunStatus.PAID, PayrollRunStatus.CANCELLED]:
+            return False
+        if self.editing_deadline and timezone.now() > self.editing_deadline:
+            return False
+        return True
 
     class Meta:
         verbose_name = _('Payroll Run')
@@ -419,7 +479,77 @@ class Payroll(TimeStampedUUIDModel):
         default=PayrollStatus.DRAFT,
         verbose_name=_('Payroll Status')
     )
+    editing_deadline = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_('Editing Deadline')
+    )
+    finalized_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_('Finalized Timestamp')
+    )
+    released_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_('Released Timestamp')
+    )
+    visibility_policy = models.CharField(
+        max_length=30,
+        choices=SalarySlipVisibilityPolicy.choices,
+        default=SalarySlipVisibilityPolicy.ON_FINALIZATION,
+        verbose_name=_('Visibility Policy')
+    )
+    compensation_type = models.CharField(
+        max_length=30,
+        blank=True,
+        default='',
+        verbose_name=_('Compensation Type Snapshot')
+    )
+    salary_unit = models.CharField(
+        max_length=20,
+        blank=True,
+        default='',
+        verbose_name=_('Salary Unit Snapshot')
+    )
+    base_salary_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0.00,
+        verbose_name=_('Base Salary Amount Snapshot')
+    )
     generated_at = models.DateTimeField(auto_now_add=True, verbose_name=_('Generated At'))
+
+    @property
+    def is_visible_to_employee(self) -> bool:
+        """
+        Determines if this payroll record is visible to the regular employee based on status,
+        editing deadline, and visibility policy.
+        Draft payroll is NEVER visible to employees.
+        """
+        if self.status in [PayrollStatus.DRAFT, PayrollStatus.PROCESSED, PayrollStatus.CANCELLED]:
+            return False
+        if self.status in [PayrollStatus.RELEASED, PayrollStatus.PAID]:
+            return True
+        if self.status == PayrollStatus.FINALIZED:
+            if self.visibility_policy == SalarySlipVisibilityPolicy.ON_FINALIZATION:
+                return True
+            elif self.visibility_policy == SalarySlipVisibilityPolicy.ON_RELEASE:
+                return False
+            elif self.visibility_policy == SalarySlipVisibilityPolicy.ON_PAYMENT_DATE:
+                pay_date = None
+                if self.payroll_run and self.payroll_run.expected_payment_date:
+                    pay_date = self.payroll_run.expected_payment_date
+                elif self.schedule_snapshot and self.schedule_snapshot.get('expected_payment_date'):
+                    try:
+                        from datetime import date
+                        pay_date = date.fromisoformat(str(self.schedule_snapshot['expected_payment_date']))
+                    except Exception:
+                        pass
+                if pay_date and timezone.now().date() >= pay_date:
+                    return True
+                return False
+        return False
 
     class Meta:
         verbose_name = _('Payroll')
@@ -489,7 +619,7 @@ class Payslip(TimeStampedUUIDModel):
 class EmployeeCompensationItem(TimeStampedUUIDModel):
     """
     Individual custom compensation components (Earnings, Bonuses, Allowances, Deductions, Overtime)
-    with fixed or percentage calculation types, effective dates, and audit history.
+    with fixed or percentage calculation types, effective dates, configuration hierarchy, and audit history.
     """
     business = models.ForeignKey(
         'organization.Business',
@@ -497,11 +627,39 @@ class EmployeeCompensationItem(TimeStampedUUIDModel):
         related_name='compensation_items',
         verbose_name=_('Business')
     )
+    scope = models.CharField(
+        max_length=20,
+        choices=ScheduleConfigScope.choices,
+        default=ScheduleConfigScope.EMPLOYEE,
+        verbose_name=_('Configuration Scope')
+    )
+    centre = models.ForeignKey(
+        'organization.Branch',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='compensation_items',
+        verbose_name=_('Centre / Branch')
+    )
     employee = models.ForeignKey(
         'organization.Employee',
         on_delete=models.CASCADE,
+        null=True,
+        blank=True,
         related_name='compensation_items',
         verbose_name=_('Employee')
+    )
+    parent_item = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='overrides',
+        verbose_name=_('Parent Inherited Component')
+    )
+    is_override = models.BooleanField(
+        default=False,
+        verbose_name=_('Is Override')
     )
     name = models.CharField(max_length=150, verbose_name=_('Component Name'))
     component_type = models.CharField(
@@ -521,7 +679,7 @@ class EmployeeCompensationItem(TimeStampedUUIDModel):
         choices=CompensationFrequency.choices,
         default=CompensationFrequency.RECURRING,
         verbose_name=_('Payment Frequency'),
-        help_text=_('RECURRING components recur monthly. ONE_TIME components apply only to their specific effective period.')
+        help_text=_('RECURRING / MONTHLY components recur monthly. WEEKLY components recur weekly. ONE_TIME components apply only to their specific effective period.')
     )
     amount = models.DecimalField(
         max_digits=12,
@@ -530,6 +688,29 @@ class EmployeeCompensationItem(TimeStampedUUIDModel):
     )
     effective_from = models.DateField(verbose_name=_('Effective From Date'))
     effective_to = models.DateField(null=True, blank=True, verbose_name=_('Effective To Date'))
+    affects_payroll = models.BooleanField(
+        default=True,
+        verbose_name=_('Affects Payroll'),
+        help_text=_('When True, eligible for payroll calculation. When False, excluded from payroll calculations.')
+    )
+    is_applied = models.BooleanField(
+        default=False,
+        verbose_name=_('Is Applied'),
+        help_text=_('Tracks whether a one-time component has been included in a payroll.')
+    )
+    applied_in_payroll = models.ForeignKey(
+        'Payroll',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='applied_one_time_components',
+        verbose_name=_('Applied In Payroll')
+    )
+    applied_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_('Applied At')
+    )
     reason = models.TextField(blank=True, verbose_name=_('Reason'))
     notes = models.TextField(blank=True, verbose_name=_('Notes'))
     is_active = models.BooleanField(default=True, verbose_name=_('Is Active'))
@@ -549,15 +730,41 @@ class EmployeeCompensationItem(TimeStampedUUIDModel):
         indexes = [
             models.Index(fields=['employee', 'is_active', '-effective_from'], name='idx_comp_emp_act_eff'),
             models.Index(fields=['business', 'component_type'], name='idx_comp_biz_type'),
+            models.Index(fields=['business', 'scope', 'is_active'], name='idx_comp_biz_scope_act'),
+            models.Index(fields=['centre', 'scope', 'is_active'], name='idx_comp_cen_scope_act'),
         ]
 
     def save(self, *args, **kwargs):
-        if not self.business_id and self.employee_id:
-            self.business = self.employee.business
+        if not self.business_id:
+            if self.employee_id:
+                self.business = self.employee.business
+            elif self.centre_id:
+                self.business = self.centre.business
         super().save(*args, **kwargs)
 
+    @property
+    def is_one_time(self) -> bool:
+        return self.frequency == CompensationFrequency.ONE_TIME
+
+    @property
+    def is_recurring(self) -> bool:
+        return self.frequency in [CompensationFrequency.RECURRING, CompensationFrequency.MONTHLY, CompensationFrequency.WEEKLY]
+
+    @property
+    def recurrence_type(self) -> str:
+        return 'ONE_TIME' if self.is_one_time else 'RECURRING'
+
+    @property
+    def recurrence_frequency(self) -> str:
+        if self.frequency == CompensationFrequency.WEEKLY:
+            return 'WEEKLY'
+        elif self.is_recurring:
+            return 'MONTHLY'
+        return 'NONE'
+
     def __str__(self):
-        return f"{self.employee}: {self.name} ({self.component_type}) - {self.amount}"
+        target = f"{self.employee}" if self.employee else (f"Centre {self.centre}" if self.centre else f"Enterprise {self.business}")
+        return f"{self.scope} [{target}]: {self.name} ({self.component_type}) - {self.amount}"
 
 
 class PayrollLineItemType(models.TextChoices):
@@ -694,7 +901,20 @@ class PayrollScheduleConfig(TimeStampedUUIDModel):
         verbose_name=_('Compensation Type')
     )
 
-    # 2. Pay Frequency & Cycle
+    # 2. Simplified Salary Slip Generation Schedule (DAILY, WEEKLY, MONTHLY)
+    generation_type = models.CharField(
+        max_length=20,
+        choices=GenerationType.choices,
+        default=GenerationType.MONTHLY,
+        verbose_name=_('Salary Slip Generation Type')
+    )
+    generation_weekday = models.PositiveSmallIntegerField(
+        default=0,
+        verbose_name=_('Salary Slip Generation Day'),
+        help_text=_('0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday')
+    )
+
+    # Pay Frequency & Cycle (Synchronized with generation_type for backward compatibility)
     pay_frequency = models.CharField(
         max_length=30,
         choices=PayFrequency.choices,
@@ -740,7 +960,7 @@ class PayrollScheduleConfig(TimeStampedUUIDModel):
         verbose_name=_('Configured Generation Day of Month')
     )
 
-    # 4. Approval Requirements
+    # 4. Approval Requirements & Editing Window
     approval_required = models.BooleanField(
         default=True,
         verbose_name=_('Approval Required Before Finalization')
@@ -753,6 +973,27 @@ class PayrollScheduleConfig(TimeStampedUUIDModel):
     review_deadline_days = models.PositiveSmallIntegerField(
         default=3,
         verbose_name=_('Review Deadline (Days)')
+    )
+    editable_period_duration = models.PositiveSmallIntegerField(
+        default=3,
+        verbose_name=_('Editable Period Duration'),
+        help_text=_('Configured duration for which draft payroll and attendance can receive edits.')
+    )
+    editing_period_unit = models.CharField(
+        max_length=10,
+        choices=EditingPeriodUnit.choices,
+        default=EditingPeriodUnit.DAYS,
+        verbose_name=_('Editing Period Unit')
+    )
+    finalization_deadline_days = models.PositiveSmallIntegerField(
+        default=3,
+        verbose_name=_('Payroll Finalization Deadline (Days)')
+    )
+    visibility_policy = models.CharField(
+        max_length=30,
+        choices=SalarySlipVisibilityPolicy.choices,
+        default=SalarySlipVisibilityPolicy.ON_FINALIZATION,
+        verbose_name=_('Salary Slip Visibility Policy')
     )
 
     # 5. Expected Payment Schedule
@@ -856,4 +1097,244 @@ class PayrollScheduleHistory(TimeStampedUUIDModel):
 
     def __str__(self):
         return f"History for {self.config.id} [{self.scope}] at {self.created_at}"
+
+
+class PayrollAdjustmentType(models.TextChoices):
+    EARNING = 'EARNING', _('Additional Earning')
+    ALLOWANCE = 'ALLOWANCE', _('Additional Allowance')
+    BONUS = 'BONUS', _('Bonus')
+    DEDUCTION = 'DEDUCTION', _('Deduction')
+    OVERTIME = 'OVERTIME', _('Approved Overtime Adjustment')
+    OTHER = 'OTHER', _('Other Payroll Adjustment')
+
+
+class PayrollAdjustment(TimeStampedUUIDModel):
+    """
+    Audit-tracked adjustments made to an in-flight payroll run during its editable window.
+    Preserves permanent compensation configurations while applying run-specific modifications.
+    """
+    ADJUSTMENT_TYPES = PayrollAdjustmentType.choices
+    business = models.ForeignKey(
+        'organization.Business',
+        on_delete=models.CASCADE,
+        related_name='payroll_adjustments',
+        verbose_name=_('Business')
+    )
+    payroll_run = models.ForeignKey(
+        PayrollRun,
+        on_delete=models.CASCADE,
+        related_name='adjustments',
+        verbose_name=_('Payroll Run')
+    )
+    payroll = models.ForeignKey(
+        Payroll,
+        on_delete=models.CASCADE,
+        related_name='adjustments',
+        verbose_name=_('Payroll Record')
+    )
+    employee = models.ForeignKey(
+        'organization.Employee',
+        on_delete=models.CASCADE,
+        related_name='payroll_adjustments',
+        verbose_name=_('Employee')
+    )
+    adjustment_type = models.CharField(
+        max_length=30,
+        choices=ADJUSTMENT_TYPES,
+        default='EARNING',
+        verbose_name=_('Adjustment Type')
+    )
+    name = models.CharField(max_length=150, verbose_name=_('Item Name'))
+    previous_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0.00,
+        verbose_name=_('Previous Amount')
+    )
+    new_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        verbose_name=_('New Amount')
+    )
+    is_deduction = models.BooleanField(
+        default=False,
+        verbose_name=_('Is Deduction')
+    )
+    reason = models.TextField(verbose_name=_('Adjustment Reason'))
+    adjusted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='payroll_adjustments_authored',
+        verbose_name=_('Adjusted By')
+    )
+
+    class Meta:
+        verbose_name = _('Payroll Adjustment')
+        verbose_name_plural = _('Payroll Adjustments')
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.employee}: {self.name} ({self.previous_amount} -> {self.new_amount})"
+
+
+class PayrollExceptionType(models.TextChoices):
+    ABSENT = 'ABSENT', _('Missing Attendance / Confirmed Absence')
+    LATE = 'LATE', _('Late Arrival Beyond Grace Period')
+    HALF_DAY = 'HALF_DAY', _('Half-Day Attendance')
+    LEAVE_EARLY = 'LEAVE_EARLY', _('Early Departure')
+    UNPAID_LEAVE = 'UNPAID_LEAVE', _('Approved Unpaid Leave')
+    HOLIDAY_WORK = 'HOLIDAY_WORK', _('Work on Public Holiday')
+    WEEK_OFF_WORK = 'WEEK_OFF_WORK', _('Work on Weekly Off')
+    PENDING_LEAVE = 'PENDING_LEAVE', _('Unresolved Pending Leave Request')
+    OTHER = 'OTHER', _('Other Exception')
+
+
+class PayrollExceptionReviewStatus(models.TextChoices):
+    CALCULATED = 'CALCULATED', _('Calculated (Default Applied)')
+    AWAITING_REVIEW = 'AWAITING_REVIEW', _('Awaiting Review')
+    APPROVED = 'APPROVED', _('Approved by Manager')
+    WAIVED = 'WAIVED', _('Waived by Manager')
+    REJECTED = 'REJECTED', _('Rejected by Manager')
+
+
+class PayrollException(TimeStampedUUIDModel):
+    """
+    Tracks policy-driven attendance-to-payroll exceptions (absences, late arrivals,
+    half-days, holiday/weekly-off work, unpaid leaves).
+    Allows managers to review, waive, approve, or adjust deductions/additions during
+    the payroll editing window before finalization.
+    """
+    business = models.ForeignKey(
+        'organization.Business',
+        on_delete=models.CASCADE,
+        related_name='payroll_exceptions',
+        verbose_name=_('Business')
+    )
+    payroll_run = models.ForeignKey(
+        PayrollRun,
+        on_delete=models.CASCADE,
+        related_name='exceptions',
+        verbose_name=_('Payroll Run')
+    )
+    payroll = models.ForeignKey(
+        Payroll,
+        on_delete=models.CASCADE,
+        related_name='exceptions',
+        verbose_name=_('Payroll Record')
+    )
+    employee = models.ForeignKey(
+        'organization.Employee',
+        on_delete=models.CASCADE,
+        related_name='payroll_exceptions',
+        verbose_name=_('Employee')
+    )
+    centre = models.ForeignKey(
+        'organization.Branch',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='payroll_exceptions',
+        verbose_name=_('Centre / Branch')
+    )
+    attendance_date = models.DateField(verbose_name=_('Attendance Date'))
+    attendance_status = models.CharField(
+        max_length=30,
+        default='ABSENT',
+        verbose_name=_('Attendance Status')
+    )
+    scheduled_hours = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=8.00,
+        verbose_name=_('Scheduled Working Hours')
+    )
+    actual_hours = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        verbose_name=_('Actual Working Hours')
+    )
+    exception_type = models.CharField(
+        max_length=30,
+        choices=PayrollExceptionType.choices,
+        default=PayrollExceptionType.ABSENT,
+        verbose_name=_('Exception Type')
+    )
+    exception_reason = models.CharField(
+        max_length=255,
+        verbose_name=_('Exception Reason')
+    )
+    proposed_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0.00,
+        verbose_name=_('Proposed Amount')
+    )
+    is_deduction = models.BooleanField(
+        default=True,
+        verbose_name=_('Is Deduction')
+    )
+    policy_applied = models.CharField(
+        max_length=255,
+        blank=True,
+        default='',
+        verbose_name=_('Policy Applied')
+    )
+    review_status = models.CharField(
+        max_length=30,
+        choices=PayrollExceptionReviewStatus.choices,
+        default=PayrollExceptionReviewStatus.AWAITING_REVIEW,
+        verbose_name=_('Review Status')
+    )
+    decision_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        verbose_name=_('Final Decision Amount')
+    )
+    decision_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='reviewed_payroll_exceptions',
+        verbose_name=_('Decision Author')
+    )
+    decision_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_('Decision Timestamp')
+    )
+    decision_reason = models.TextField(
+        blank=True,
+        default='',
+        verbose_name=_('Decision Reason / Audit Comment')
+    )
+    is_applied_to_payroll = models.BooleanField(
+        default=True,
+        verbose_name=_('Is Applied to Payroll')
+    )
+
+    class Meta:
+        verbose_name = _('Payroll Exception')
+        verbose_name_plural = _('Payroll Exceptions')
+        ordering = ['attendance_date', 'employee']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['payroll', 'attendance_date', 'exception_type'],
+                name='unique_payroll_attendance_exception'
+            )
+        ]
+        indexes = [
+            models.Index(fields=['payroll_run', 'review_status']),
+            models.Index(fields=['employee', 'attendance_date']),
+        ]
+
+    def __str__(self):
+        sign = '-' if self.is_deduction else '+'
+        return f"{self.employee}: {self.attendance_date} | {self.exception_reason} | {sign}{self.proposed_amount} ({self.review_status})"
 

@@ -405,6 +405,84 @@ class EmployeeScheduleAssignment(TimeStampedUUIDModel):
         return f"{self.employee}: {self.schedule.name} ({self.effective_from} to {self.effective_to or 'Present'})"
 
 
+class EmployeeWorkingHour(TimeStampedUUIDModel):
+    """
+    Individual weekday working-hours record per employee (Monday..Sunday, 0..6).
+    Tracks day-level enabled status, shift start/end times, break intervals,
+    and inheritance/override provenance relative to Centre policy.
+    Every employee maintains exactly 7 records.
+    """
+    CONFIGURATION_SOURCE_CHOICES = [
+        ('CENTRE', _('Inherited from Centre')),
+        ('ENTERPRISE', _('Inherited from Enterprise')),
+        ('EMPLOYEE', _('Employee Override')),
+    ]
+
+    employee = models.ForeignKey(
+        'organization.Employee',
+        on_delete=models.CASCADE,
+        related_name='working_hours',
+        verbose_name=_('Employee')
+    )
+    day_of_week = models.PositiveSmallIntegerField(
+        choices=WorkScheduleDay.DAYS_OF_WEEK,
+        verbose_name=_('Day of Week')
+    )
+    is_enabled = models.BooleanField(
+        default=True,
+        verbose_name=_('Is Working Day Enabled')
+    )
+    start_time = models.TimeField(
+        null=True,
+        blank=True,
+        verbose_name=_('Shift Start Time')
+    )
+    end_time = models.TimeField(
+        null=True,
+        blank=True,
+        verbose_name=_('Shift End Time')
+    )
+    break_start = models.TimeField(
+        null=True,
+        blank=True,
+        verbose_name=_('Break Start Time')
+    )
+    break_end = models.TimeField(
+        null=True,
+        blank=True,
+        verbose_name=_('Break End Time')
+    )
+    is_override = models.BooleanField(
+        default=False,
+        verbose_name=_('Is Employee Custom Override')
+    )
+    configuration_source = models.CharField(
+        max_length=50,
+        choices=CONFIGURATION_SOURCE_CHOICES,
+        default='CENTRE',
+        verbose_name=_('Configuration Source')
+    )
+
+    class Meta:
+        verbose_name = _('Employee Working Hour')
+        verbose_name_plural = _('Employee Working Hours')
+        constraints = [
+            models.UniqueConstraint(
+                fields=['employee', 'day_of_week'],
+                name='unique_employee_weekday_working_hour'
+            )
+        ]
+        indexes = [
+            models.Index(fields=['employee', 'day_of_week'], name='idx_emp_weekday_wh'),
+        ]
+        ordering = ['employee', 'day_of_week']
+
+    def __str__(self):
+        status = 'Working' if self.is_enabled else 'Day Off'
+        times = f"{self.start_time}-{self.end_time}" if (self.is_enabled and self.start_time and self.end_time) else "Off"
+        return f"{self.employee} - {self.get_day_of_week_display()}: {status} ({times})"
+
+
 class AttendanceCorrection(TimeStampedUUIDModel):
     """
     Formal correction request for missing/incorrect punch events.
@@ -635,3 +713,100 @@ class AttendancePolicyOverride(TimeStampedUUIDModel):
 
     def __str__(self):
         return f"Policy Override for {self.centre.name}"
+
+
+class QRValidityPeriod(models.TextChoices):
+    DYNAMIC = 'DYNAMIC', _('Dynamic (Short-Lived)')
+    DAILY = 'DAILY', _('Daily (Calendar Day)')
+    WEEKLY = 'WEEKLY', _('Weekly (Calendar Week)')
+    MONTHLY = 'MONTHLY', _('Monthly (Calendar Month)')
+
+
+class AttendanceQRCode(TimeStampedUUIDModel):
+    """
+    Cryptographically secure, policy-driven QR code for Centre Attendance Kiosks.
+    Supports dynamic, daily, weekly, and monthly validity with server-side validation
+    and automatic expired record cleanup during QR generation requests.
+    """
+    business = models.ForeignKey(
+        'organization.Business',
+        on_delete=models.CASCADE,
+        related_name='attendance_qr_codes',
+        verbose_name=_('Business')
+    )
+    centre = models.ForeignKey(
+        'organization.Branch',
+        on_delete=models.CASCADE,
+        related_name='attendance_qr_codes',
+        verbose_name=_('Centre / Branch')
+    )
+    token = models.CharField(
+        max_length=255,
+        unique=True,
+        db_index=True,
+        verbose_name=_('Cryptographic Token')
+    )
+    code_payload = models.TextField(
+        verbose_name=_('Full QR Code Payload')
+    )
+    validity_period = models.CharField(
+        max_length=20,
+        choices=QRValidityPeriod.choices,
+        default=QRValidityPeriod.DYNAMIC,
+        db_index=True,
+        verbose_name=_('Validity Period')
+    )
+    expires_at = models.DateTimeField(
+        db_index=True,
+        verbose_name=_('Expiry Timestamp')
+    )
+    is_active = models.BooleanField(
+        default=True,
+        db_index=True,
+        verbose_name=_('Is Active')
+    )
+    is_revoked = models.BooleanField(
+        default=False,
+        db_index=True,
+        verbose_name=_('Is Revoked')
+    )
+    revoked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_('Revoked At')
+    )
+    revoked_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='revoked_attendance_qrs',
+        verbose_name=_('Revoked By')
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='created_attendance_qrs',
+        verbose_name=_('Created By')
+    )
+    metadata = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name=_('Security and Policy Metadata')
+    )
+
+    class Meta:
+        verbose_name = _('Attendance QR Code')
+        verbose_name_plural = _('Attendance QR Codes')
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['centre', 'is_active', 'expires_at'], name='idx_qr_cen_act_exp'),
+            models.Index(fields=['business', 'expires_at'], name='idx_qr_biz_exp'),
+            models.Index(fields=['token', 'is_active', 'is_revoked'], name='idx_qr_tok_act_rev'),
+        ]
+
+    def __str__(self):
+        return f"QR [{self.centre.name}] ({self.validity_period}) expires {self.expires_at}"
+

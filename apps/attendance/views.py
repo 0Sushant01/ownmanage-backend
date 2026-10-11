@@ -4,7 +4,7 @@ from django.utils import timezone
 from rest_framework import status, views
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError, NotFound
 
 from apps.core.permissions import get_user_context
 from apps.organization.models import BusinessRole, Employee, Branch
@@ -12,7 +12,8 @@ from apps.organization.services.policy_resolver import PolicyResolver
 from apps.organization.services.permission_service import PermissionService
 from apps.attendance.models import (
     AttendanceDay, AttendanceEvent, AttendanceStatus,
-    AttendanceEventType, AttendanceEventSource, AttendanceMethod
+    AttendanceEventType, AttendanceEventSource, AttendanceMethod,
+    QRValidityPeriod, AttendanceQRCode
 )
 from apps.attendance.services.attendance_service import AttendanceService
 from apps.attendance.serializers import AttendanceDaySerializer, AttendanceEventSerializer
@@ -317,37 +318,62 @@ class AttendanceCalendarView(views.APIView):
                 leave_map[d] = lr.leave_type.name if lr.leave_type else 'Leave'
                 d += timedelta(days=1)
 
-        # Determine weekly off days from work schedule
+        # Determine weekly off days from EmployeeWorkingHour, WorkSchedule, or Policy
         week_off_days = set()  # 0=Mon..6=Sun
-        try:
-            from django.db.models import Q
-            from apps.attendance.models import EmployeeScheduleAssignment, WorkScheduleDay
-            assignment = EmployeeScheduleAssignment.objects.filter(
-                employee=emp,
-                effective_from__lte=last_day,
-            ).filter(
-                Q(effective_to__isnull=True) | Q(effective_to__gte=first_day)
-            ).select_related('schedule').order_by('-effective_from').first()
-            if assignment:
-                schedule_days = WorkScheduleDay.objects.filter(schedule=assignment.schedule)
-                for sd in schedule_days:
-                    if not sd.is_work_day:
-                        week_off_days.add(sd.day_of_week)
-        except Exception:
-            pass
+        from apps.attendance.models import EmployeeWorkingHour
+        emp_whs = list(EmployeeWorkingHour.objects.filter(employee=emp))
+        if emp_whs:
+            for wh in emp_whs:
+                if not wh.is_enabled:
+                    week_off_days.add(wh.day_of_week)
+        else:
+            try:
+                from django.db.models import Q
+                from apps.attendance.models import EmployeeScheduleAssignment, WorkScheduleDay
+                assignment = EmployeeScheduleAssignment.objects.filter(
+                    employee=emp,
+                    effective_from__lte=last_day,
+                ).filter(
+                    Q(effective_to__isnull=True) | Q(effective_to__gte=first_day)
+                ).select_related('schedule').order_by('-effective_from').first()
+                if assignment:
+                    schedule_days = WorkScheduleDay.objects.filter(schedule=assignment.schedule)
+                    for sd in schedule_days:
+                        if not sd.is_work_day:
+                            week_off_days.add(sd.day_of_week)
+            except Exception:
+                pass
+
+            if not week_off_days:
+                from apps.organization.services.policy_resolver import PolicyResolver
+                policy_data = PolicyResolver.get_attendance_policy(centre=emp.branch, business=emp.business)
+                eff = policy_data.get('effective', {})
+                weekly_off_days_list = eff.get('weekly_off_days')
+                if weekly_off_days_list is not None and isinstance(weekly_off_days_list, list):
+                    week_off_days = set(int(x) for x in weekly_off_days_list if str(x).isdigit())
+                else:
+                    week_off_days = {int(eff.get('weekly_off', 6))}
 
         today = date.today()
         num_days = cal_mod.monthrange(year, month)[1]
         calendar_data = []
         for day_num in range(1, num_days + 1):
             d = date(year, month, day_num)
+            is_weekly_off_day = (d.weekday() in week_off_days)
+
             if d in attendance_map:
                 entry = attendance_map[d]
+                status_val = entry['status']
+                # If this day is an off day and has no punches or was saved as ABSENT/NOT_MARKED,
+                # display as WEEK_OFF (Off day, not Absent)
+                if is_weekly_off_day and (status_val in [AttendanceStatus.ABSENT, AttendanceStatus.NOT_MARKED] or entry['total_work_seconds'] == 0):
+                    status_val = 'WEEK_OFF'
+
                 calendar_data.append({
                     'date': str(d),
                     'day': day_num,
                     'weekday': d.strftime('%a'),
-                    'status': entry['status'],
+                    'status': status_val,
                     'total_work_seconds': entry['total_work_seconds'],
                     'work_hours': entry['work_hours'],
                     'overtime_seconds': entry['overtime_seconds'],
@@ -364,7 +390,7 @@ class AttendanceCalendarView(views.APIView):
                 # Determine status for days without attendance records
                 if d in holiday_map:
                     fill_status = 'HOLIDAY'
-                elif d.weekday() in week_off_days:
+                elif is_weekly_off_day:
                     fill_status = 'WEEK_OFF'
                 elif d in leave_map:
                     fill_status = 'LEAVE'
@@ -762,12 +788,16 @@ class AttendanceDailyRegisterView(views.APIView):
                     if is_holiday:
                         final_status = 'HOLIDAY'
                     else:
-                        # Check weekly off days
-                        w_days = policy.get('weekly_off_days')
-                        if w_days is not None and isinstance(w_days, list):
-                            is_off = weekday_idx in [int(x) for x in w_days]
+                        # Check weekly off days using EmployeeWorkingHour or policy
+                        emp_wh = emp.working_hours.filter(day_of_week=weekday_idx).first() if hasattr(emp, 'working_hours') else None
+                        if emp_wh:
+                            is_off = not emp_wh.is_enabled
                         else:
-                            is_off = (weekday_idx == int(policy.get('weekly_off', 6)))
+                            w_days = policy.get('weekly_off_days')
+                            if w_days is not None and isinstance(w_days, list):
+                                is_off = weekday_idx in [int(x) for x in w_days]
+                            else:
+                                is_off = (weekday_idx == int(policy.get('weekly_off', 6)))
 
                         if is_off:
                             final_status = 'WEEKLY_OFF'
@@ -1020,20 +1050,28 @@ class AttendanceRecordOverrideView(views.APIView):
 
 class AttendanceQRTokenView(views.APIView):
     """
-    Generates a secure QR payload for a centre.
-    Used for QR Attendance kiosks or centre check-in posters.
+    Secure QR Code Generator & Reuser for Centre Attendance Kiosks.
+    - Validates requester permissions (SuperAdmin, Business Admin, or assigned Centre Manager).
+    - Performs just-in-time expired QR cleanup for the centre within an atomic transaction.
+    - Reuses an existing valid, active QR if compatible (unless force_refresh is requested).
+    - Generates unpredictable cryptographically secure tokens.
+    - Supports DYNAMIC, DAILY, WEEKLY, and MONTHLY validity periods.
     """
     permission_classes = [IsAuthenticated]
 
-    def get(self, request):
-        import time as time_lib
+    def _resolve_and_authorize_centre(self, request, centre_id: Optional[str] = None):
         ctx = get_user_context(request)
         biz = ctx['business']
-        centre_id = request.query_params.get('centre_id')
+        role = ctx.get('role')
+
+        if not ctx['is_superadmin'] and role not in [BusinessRole.BUSINESS_ADMIN, BusinessRole.SUPERADMIN, BusinessRole.MANAGER]:
+            raise PermissionDenied('Only administrators and centre managers are authorized to generate QR codes.')
 
         centre = None
         if centre_id and centre_id not in ['all', 'ALL', 'null', '']:
-            centre = Branch.objects.filter(id=centre_id, business=biz).first()
+            centre = Branch.objects.filter(id=centre_id, business=biz, is_active=True).first()
+            if not centre:
+                raise NotFound('Specified centre was not found for this business.')
         elif ctx.get('employee') and ctx['employee'].branch:
             centre = ctx['employee'].branch
         else:
@@ -1042,15 +1080,135 @@ class AttendanceQRTokenView(views.APIView):
         if not centre:
             raise NotFound('No active centre available for QR generation.')
 
-        ts = int(time_lib.time())
-        token = f"OWNMANAGE:CENTRE:{centre.id}:{ts}"
+        # Centre-level scope validation for Managers
+        if role == BusinessRole.MANAGER and not ctx['is_superadmin']:
+            from apps.organization.services.permission_service import PermissionService
+            emp = ctx.get('employee')
+            is_assigned = (
+                (emp and emp.branch_id == centre.id)
+                or (centre.manager_id == request.user.id)
+                or PermissionService.has_permission(request.user, 'attendance.edit', business=biz, centre=centre)
+            )
+            if not is_assigned:
+                raise PermissionDenied('Managers can only manage QR codes for their assigned centre.')
+
+        return centre
+
+    def get(self, request):
+        centre_id = request.query_params.get('centre_id')
+        centre = self._resolve_and_authorize_centre(request, centre_id)
+
+        validity = request.query_params.get('validity_period') or QRValidityPeriod.DYNAMIC
+        dynamic_sec = int(request.query_params.get('expires_in_seconds') or request.query_params.get('dynamic_seconds') or 300)
+        force_refresh = str(request.query_params.get('refresh') or request.query_params.get('force_refresh', '')).lower() in ['true', '1', 'yes']
+
+        from apps.attendance.services.qr_service import AttendanceQRService
+        qr_obj, was_created, cleaned_count = AttendanceQRService.generate_or_reuse_qr_code(
+            centre=centre,
+            user=request.user,
+            validity_period=validity,
+            dynamic_seconds=dynamic_sec,
+            force_refresh=force_refresh
+        )
+
+        remaining_seconds = max(0, int((qr_obj.expires_at - timezone.now()).total_seconds()))
 
         return Response({
             'centre_id': str(centre.id),
             'centre_name': centre.name,
-            'qr_code': token,
-            'timestamp': ts,
-            'expires_in_seconds': 300,
+            'qr_code': qr_obj.code_payload,
+            'token': qr_obj.token,
+            'validity_period': qr_obj.validity_period,
+            'expires_at': qr_obj.expires_at.isoformat(),
+            'expires_in_seconds': remaining_seconds,
+            'timestamp': int(qr_obj.created_at.timestamp()),
+            'reused': not was_created,
+            'cleaned_up_expired_count': cleaned_count,
+        })
+
+    def post(self, request):
+        centre_id = request.data.get('centre_id') or request.query_params.get('centre_id')
+        centre = self._resolve_and_authorize_centre(request, centre_id)
+
+        validity = request.data.get('validity_period') or request.query_params.get('validity_period') or QRValidityPeriod.DYNAMIC
+        dynamic_sec = int(request.data.get('expires_in_seconds') or request.data.get('dynamic_seconds') or 300)
+        force_refresh = str(request.data.get('refresh') or request.data.get('force_refresh', 'true')).lower() in ['true', '1', 'yes']
+
+        from apps.attendance.services.qr_service import AttendanceQRService
+        qr_obj, was_created, cleaned_count = AttendanceQRService.generate_or_reuse_qr_code(
+            centre=centre,
+            user=request.user,
+            validity_period=validity,
+            dynamic_seconds=dynamic_sec,
+            force_refresh=force_refresh
+        )
+
+        remaining_seconds = max(0, int((qr_obj.expires_at - timezone.now()).total_seconds()))
+
+        return Response({
+            'centre_id': str(centre.id),
+            'centre_name': centre.name,
+            'qr_code': qr_obj.code_payload,
+            'token': qr_obj.token,
+            'validity_period': qr_obj.validity_period,
+            'expires_at': qr_obj.expires_at.isoformat(),
+            'expires_in_seconds': remaining_seconds,
+            'timestamp': int(qr_obj.created_at.timestamp()),
+            'reused': not was_created,
+            'cleaned_up_expired_count': cleaned_count,
+        }, status=status.HTTP_201_CREATED if was_created else status.HTTP_200_OK)
+
+
+class AttendanceQRRevokeView(views.APIView):
+    """
+    Revokes active QR codes for a centre immediately.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        centre_id = request.data.get('centre_id') or request.query_params.get('centre_id')
+        if not centre_id:
+            raise ValidationError({'detail': 'centre_id is required.'})
+
+        ctx = get_user_context(request)
+        biz = ctx['business']
+        role = ctx.get('role')
+
+        if not ctx['is_superadmin'] and role not in [BusinessRole.BUSINESS_ADMIN, BusinessRole.SUPERADMIN, BusinessRole.MANAGER]:
+            raise PermissionDenied('Only administrators and centre managers are authorized to revoke QR codes.')
+
+        centre = Branch.objects.filter(id=centre_id, business=biz, is_active=True).first()
+        if not centre:
+            raise NotFound('Specified centre was not found for this business.')
+
+        if role == BusinessRole.MANAGER and not ctx['is_superadmin']:
+            from apps.organization.services.permission_service import PermissionService
+            emp = ctx.get('employee')
+            is_assigned = (
+                (emp and emp.branch_id == centre.id)
+                or (centre.manager_id == request.user.id)
+                or PermissionService.has_permission(request.user, 'attendance.edit', business=biz, centre=centre)
+            )
+            if not is_assigned:
+                raise PermissionDenied('Managers can only revoke QR codes for their assigned centre.')
+
+        qr_id = request.data.get('qr_id')
+        token = request.data.get('token')
+        reason = request.data.get('reason', 'Admin revocation')
+
+        from apps.attendance.services.qr_service import AttendanceQRService
+        revoked_count = AttendanceQRService.revoke_qr_code(
+            centre=centre,
+            qr_id=qr_id,
+            token=token,
+            user=request.user,
+            reason=reason
+        )
+
+        return Response({
+            'detail': f'{revoked_count} QR code(s) revoked successfully.',
+            'centre_id': str(centre.id),
+            'revoked_count': revoked_count,
         })
 
 
@@ -1151,6 +1309,13 @@ class AttendanceMonthlyRegisterView(views.APIView):
                 emp_leaves_map[e_id] = []
             emp_leaves_map[e_id].append(l)
 
+        from apps.attendance.models import EmployeeWorkingHour
+        emp_ids = [e.id for e in employees]
+        all_wh_records = EmployeeWorkingHour.objects.filter(employee_id__in=emp_ids)
+        emp_wh_map = {}
+        for wh in all_wh_records:
+            emp_wh_map.setdefault(str(wh.employee_id), {})[wh.day_of_week] = wh
+
         policies_cache = {}
         emp_rows = []
         overall_summary = {
@@ -1215,12 +1380,16 @@ class AttendanceMonthlyRegisterView(views.APIView):
                         for h in holidays
                     )
 
-                    # Check weekly off
-                    w_days = policy.get('weekly_off_days')
-                    if w_days is not None and isinstance(w_days, list):
-                        is_weekly_off = w_idx in [int(x) for x in w_days]
+                    # Check weekly off using employee-specific working hours
+                    emp_wh_dict = emp_wh_map.get(str(emp.id), {})
+                    if w_idx in emp_wh_dict:
+                        is_weekly_off = not emp_wh_dict[w_idx].is_enabled
                     else:
-                        is_weekly_off = (w_idx == int(policy.get('weekly_off', 6)))
+                        w_days = policy.get('weekly_off_days')
+                        if w_days is not None and isinstance(w_days, list):
+                            is_weekly_off = w_idx in [int(x) for x in w_days]
+                        else:
+                            is_weekly_off = (w_idx == int(policy.get('weekly_off', 6)))
 
                     if is_on_leave:
                         status_val = 'ON_LEAVE'

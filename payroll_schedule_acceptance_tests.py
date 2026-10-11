@@ -1,6 +1,18 @@
 """
-Acceptance Test Suite for OWNManage Payroll Schedule, Generation Rules,
-Salary Periods, and Payment Configuration.
+Acceptance Test Suite for OWNManage Simplified Salary Slip Generation Schedule
+Supports exactly three generation types:
+1. DAILY
+2. WEEKLY (Salary Slip Generation Day: Monday .. Sunday)
+3. MONTHLY (Salary Slip Generation Date: 1 .. 31 with February/Leap-year month-end clamping)
+Enforces:
+- Single effective generation type per employee
+- Enterprise Default -> Centre Override -> Employee Override hierarchy
+- Enable/Disable Employee Override with historical audit preservation
+- Contiguous non-overlapping weekly periods
+- Deterministic month-end clamping
+- Duplicate generation prevention
+- Historical payroll immutability
+- Full RBAC enforcement
 """
 
 import os
@@ -14,13 +26,14 @@ django.setup()
 
 from django.utils import timezone
 from rest_framework.test import APIRequestFactory, force_authenticate
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import ValidationError as DRFValidationError, PermissionDenied
+from django.core.exceptions import ValidationError as DjangoValidationError
 
 from apps.organization.models import Business, Branch, Employee, BusinessRole
 from apps.accounts.models import User
 from apps.payroll.models import (
     PayrollScheduleConfig, PayrollScheduleHistory, ScheduleConfigScope,
-    CompensationType, PayFrequency, MonthEndRule,
+    CompensationType, PayFrequency, GenerationType, MonthEndRule,
     PayrollGenerationMode, PaymentScheduleRule,
     Payroll, PayrollRun, PayrollRunStatus, PayrollStatus, SalaryRevision
 )
@@ -30,7 +43,10 @@ from apps.payroll.schedule_views import (
     EmployeePayrollScheduleView, EmployeePayrollScheduleResetView,
     CentrePayrollScheduleView, EnterprisePayrollScheduleView
 )
-from apps.payroll.revision_views import PayrollRunListCreateView, PayrollRunFinalizeView
+from apps.payroll.revision_views import (
+    PayrollRunListCreateView, PayrollRunFinalizeView,
+    EmployeeSalaryRevisionListCreateView, EmployeeSalaryComparisonView
+)
 
 passed_checks = []
 failed_checks = []
@@ -46,7 +62,7 @@ def record_test(name: str, passed: bool, details: str = ""):
 
 def run_schedule_tests():
     print("======================================================================")
-    print("STARTING PAYROLL SCHEDULE & COMPENSATION CYCLE ACCEPTANCE TESTS")
+    print("STARTING SIMPLIFIED SALARY SLIP GENERATION ACCEPTANCE TESTS")
     print("======================================================================")
 
     biz = Business.objects.filter(name="Acme Enterprises").first() or Business.objects.first()
@@ -56,359 +72,607 @@ def run_schedule_tests():
     assert emp is not None, "An employee must exist in database"
 
     admin_user = biz.memberships.filter(role=BusinessRole.BUSINESS_ADMIN).first().user
+    staff_user = emp.user if emp.user else User.objects.filter(memberships__role=BusinessRole.STAFF).first()
 
     # ------------------------------------------------------------------
-    # 1. PAY FREQUENCY & PERIOD BOUNDARIES GENERATION
+    # 1. DAILY GENERATION CONFIGURATION & ONE-DAY PERIODS
     # ------------------------------------------------------------------
-    print("\n--- 1. Testing Pay Frequencies & Deterministic Period Calculations ---")
+    print("\n--- 1. Testing DAILY Generation Configuration & One-Day Periods ---")
 
-    # Calendar Monthly
-    cal_cfg = {'pay_frequency': PayFrequency.MONTHLY_CALENDAR}
-    p_start, p_end = PayrollScheduleService.calculate_period_boundaries(cal_cfg, datetime.date(2026, 10, 15))
-    record_test("Calendar Monthly Period (October)", p_start == datetime.date(2026, 10, 1) and p_end == datetime.date(2026, 10, 31), f"{p_start} to {p_end}")
-
-    # Daily
-    daily_cfg = {'pay_frequency': PayFrequency.DAILY}
+    daily_cfg = {'generation_type': GenerationType.DAILY, 'pay_frequency': PayFrequency.DAILY}
     d_start, d_end = PayrollScheduleService.calculate_period_boundaries(daily_cfg, datetime.date(2026, 10, 15))
-    record_test("Daily Period Covers Single Date", d_start == datetime.date(2026, 10, 15) and d_end == datetime.date(2026, 10, 15))
+    record_test(
+        "DAILY Generation Produces Exactly 1-Day Payroll Period",
+        d_start == datetime.date(2026, 10, 15) and d_end == datetime.date(2026, 10, 15),
+        f"{d_start} to {d_end}"
+    )
 
-    # Weekly (Monday start)
-    weekly_mon = {'pay_frequency': PayFrequency.WEEKLY, 'week_start_day': 0}
-    # 2026-10-15 is Thursday -> Monday is 2026-10-12, Sunday is 2026-10-18
-    w_start, w_end = PayrollScheduleService.calculate_period_boundaries(weekly_mon, datetime.date(2026, 10, 15))
-    record_test("Weekly Period (Mon to Sun)", w_start == datetime.date(2026, 10, 12) and w_end == datetime.date(2026, 10, 18), f"{w_start} to {w_end}")
+    # Save DAILY configuration for employee
+    emp_daily = PayrollScheduleService.save_schedule(
+        scope=ScheduleConfigScope.EMPLOYEE,
+        business=biz,
+        employee=emp,
+        data={'generation_type': GenerationType.DAILY},
+        user=admin_user,
+        reason='Configure daily payroll generation'
+    )
+    res_daily = PayrollScheduleService.resolve_schedule(employee=emp)
+    record_test(
+        "DAILY Generation Configured & Resolved for Employee",
+        res_daily['effective_config']['generation_type'] == GenerationType.DAILY and
+        res_daily['effective_config']['pay_frequency'] == PayFrequency.DAILY,
+        f"resolved_type={res_daily['effective_config']['generation_type']}"
+    )
 
-    # Fortnightly (Anchor Date)
-    fort_cfg = {'pay_frequency': PayFrequency.FORTNIGHTLY, 'anchor_date': datetime.date(2026, 10, 1)}
-    f_start, f_end = PayrollScheduleService.calculate_period_boundaries(fort_cfg, datetime.date(2026, 10, 16))
-    record_test("Fortnightly 14-Day Consecutive Block", f_start == datetime.date(2026, 10, 15) and f_end == datetime.date(2026, 10, 28), f"{f_start} to {f_end}")
-
-    # ------------------------------------------------------------------
-    # 2. MONTH-END HANDLING & SHORT MONTH/LEAP YEAR TEST
-    # ------------------------------------------------------------------
-    print("\n--- 2. Testing Month-End Handling (Short Months & Leap Years) ---")
-
-    # Custom Cycle starting on 5th: 5 Oct to 4 Nov
-    cycle_5 = {'pay_frequency': PayFrequency.MONTHLY_CUSTOM, 'custom_cycle_start_day': 5}
-    c_start, c_end = PayrollScheduleService.calculate_period_boundaries(cycle_5, datetime.date(2026, 10, 20))
-    record_test("Custom Monthly Cycle (5th to 4th)", c_start == datetime.date(2026, 10, 5) and c_end == datetime.date(2026, 11, 4), f"{c_start} to {c_end}")
-
-    # Custom Cycle starting on 31st crossing into February (28 days in 2026)
-    cycle_31 = {'pay_frequency': PayFrequency.MONTHLY_CUSTOM, 'custom_cycle_start_day': 31, 'month_end_rule': MonthEndRule.CLAMP_TO_LAST_DAY}
-    jan_start, jan_end = PayrollScheduleService.calculate_period_boundaries(cycle_31, datetime.date(2026, 1, 31))
-    record_test("31st Cycle Clamps deterministically to Feb 27 in 28-day Feb", jan_start == datetime.date(2026, 1, 31) and jan_end == datetime.date(2026, 2, 27), f"{jan_start} to {jan_end}")
-
-    # Next cycle starts on Feb 28 (min(31, 28)) and ends on Mar 30 (day before Mar 31)
-    feb_start, feb_end = PayrollScheduleService.calculate_period_boundaries(cycle_31, datetime.date(2026, 2, 28))
-    record_test("Contiguous Feb Cycle Covers Feb 28 to Mar 30 Without Gap", feb_start == datetime.date(2026, 2, 28) and feb_end == datetime.date(2026, 3, 30), f"{feb_start} to {feb_end}")
-
-    # Leap Year (2028: Feb has 29 days)
-    leap_start, leap_end = PayrollScheduleService.calculate_period_boundaries(cycle_31, datetime.date(2028, 1, 31))
-    record_test("Leap Year 2028 Clamps 31st Cycle to Feb 28 (day before Feb 29)", leap_start == datetime.date(2028, 1, 31) and leap_end == datetime.date(2028, 2, 28), f"{leap_start} to {leap_end}")
-
-    # ------------------------------------------------------------------
-    # 3. PAYMENT TIMING RULES INDEPENDENT OF GENERATION
-    # ------------------------------------------------------------------
-    print("\n--- 3. Testing Payment Timing Calculation Rules ---")
-
-    p_end_ref = datetime.date(2026, 10, 31)
-
-    # Day of Following Month (e.g. 7th)
-    pay_next_month = PayrollScheduleService.calculate_expected_payment_date(p_end_ref, {'payment_rule': PaymentScheduleRule.DAY_OF_FOLLOWING_MONTH, 'payment_day_of_month': 7})
-    record_test("Payment Rule: 7th of Following Month", pay_next_month == datetime.date(2026, 11, 7), f"{pay_next_month}")
-
-    # Days after period end (e.g. 5 days after)
-    pay_offset = PayrollScheduleService.calculate_expected_payment_date(p_end_ref, {'payment_rule': PaymentScheduleRule.DAYS_AFTER_PERIOD_END, 'payment_offset_days': 5})
-    record_test("Payment Rule: 5 Days After Period End", pay_offset == datetime.date(2026, 11, 5), f"{pay_offset}")
-
-    # Specified weekday (e.g. Following Friday)
-    # 2026-10-31 is Saturday. Following Friday is 2026-11-06.
-    pay_weekday = PayrollScheduleService.calculate_expected_payment_date(p_end_ref, {'payment_rule': PaymentScheduleRule.SPECIFIED_WEEKDAY, 'payment_weekday': 4})
-    record_test("Payment Rule: Following Friday", pay_weekday == datetime.date(2026, 11, 6), f"{pay_weekday}")
-
-    # Same day as period end
-    pay_same = PayrollScheduleService.calculate_expected_payment_date(p_end_ref, {'payment_rule': PaymentScheduleRule.SAME_DAY_AS_PERIOD_END})
-    record_test("Payment Rule: Same Day as Period End", pay_same == p_end_ref)
+    # Daily calculation evaluates single day without whole-month overpay
+    daily_calc = PayrollCalculationService.calculate_employee_payroll(
+        employee=emp,
+        period_start=datetime.date(2026, 10, 15),
+        period_end=datetime.date(2026, 10, 15)
+    )
+    record_test(
+        "DAILY Payroll Calculation Evaluates 1-Day Pro-rata Correctly",
+        daily_calc['working_days'] == 1 and daily_calc['gross_amount'] <= Decimal('10000.00'),
+        f"gross={daily_calc['gross_amount']}, working_days={daily_calc['working_days']}"
+    )
 
     # ------------------------------------------------------------------
-    # 4. HIERARCHY RESOLUTION (Enterprise -> Centre -> Employee)
+    # 2. WEEKLY GENERATION FOR ALL SEVEN WEEKDAYS (0=Mon .. 6=Sun)
     # ------------------------------------------------------------------
-    print("\n--- 4. Testing Configuration Inheritance & Overrides Hierarchy ---")
+    print("\n--- 2. Testing WEEKLY Generation Across All 7 Weekdays ---")
+
+    weekday_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    ref_wednesday = datetime.date(2026, 10, 14)  # 2026-10-14 is a Wednesday (weekday 2)
+
+    for w_day, w_name in enumerate(weekday_names):
+        w_cfg = {'generation_type': GenerationType.WEEKLY, 'generation_weekday': w_day}
+        p_start, p_end = PayrollScheduleService.calculate_period_boundaries(w_cfg, ref_wednesday)
+        duration = (p_end - p_start).days + 1
+        is_exact_week = (duration == 7 and p_start.weekday() == w_day and p_end.weekday() == (w_day + 6) % 7)
+        record_test(
+            f"WEEKLY Generation Day {w_name} ({w_day}) Forms Contiguous 7-Day Block",
+            is_exact_week,
+            f"{p_start} ({weekday_names[p_start.weekday()]}) to {p_end} ({weekday_names[p_end.weekday()]})"
+        )
+
+        # Completed weekly period test
+        c_start, c_end = PayrollScheduleService.get_completed_weekly_period(w_day, ref_wednesday)
+        c_duration = (c_end - c_start).days + 1
+        record_test(
+            f"WEEKLY Completed Period for {w_name} Is Exactly 7 Days Without Overlap",
+            c_duration == 7 and c_end < ref_wednesday or (c_end == ref_wednesday - datetime.timedelta(days=1) and ref_wednesday.weekday() == w_day),
+            f"completed={c_start} to {c_end}"
+        )
+
+    # ------------------------------------------------------------------
+    # 3. MONTHLY GENERATION DATES 1-31 & FEBRUARY / LEAP YEAR CLAMPING
+    # ------------------------------------------------------------------
+    print("\n--- 3. Testing MONTHLY Generation Dates (1-31) & Month-End Clamping ---")
+
+    # Clamping tests for February 2026 (non-leap: 28 days)
+    for day in [28, 29, 30, 31]:
+        eff_date = PayrollScheduleService.get_effective_monthly_generation_date(2026, 2, day)
+        record_test(
+            f"Feb 2026 Generation Date {day} Clamps to Feb 28",
+            eff_date == datetime.date(2026, 2, 28),
+            f"clamped={eff_date}"
+        )
+
+    # Clamping tests for February 2028 (leap year: 29 days)
+    for day in [29, 30, 31]:
+        eff_leap = PayrollScheduleService.get_effective_monthly_generation_date(2028, 2, day)
+        record_test(
+            f"Feb 2028 Leap Year Generation Date {day} Clamps to Feb 29",
+            eff_leap == datetime.date(2028, 2, 29),
+            f"clamped={eff_leap}"
+        )
+
+    # Clamping tests for 30-day months (e.g. April, June, September, November)
+    eff_apr = PayrollScheduleService.get_effective_monthly_generation_date(2026, 4, 31)
+    record_test(
+        "April 30-Day Month Generation Date 31 Clamps to April 30",
+        eff_apr == datetime.date(2026, 4, 30),
+        f"clamped={eff_apr}"
+    )
+
+    # Standard day-of-month retains exact date
+    for test_day in [1, 5, 15, 25]:
+        eff_standard = PayrollScheduleService.get_effective_monthly_generation_date(2026, 10, test_day)
+        record_test(
+            f"Standard Month Generation Date {test_day} Retains Exact Day",
+            eff_standard == datetime.date(2026, 10, test_day),
+            f"result={eff_standard}"
+        )
+
+    # ------------------------------------------------------------------
+    # 4. INHERITANCE HIERARCHY (Enterprise -> Centre -> Employee)
+    # ------------------------------------------------------------------
+    print("\n--- 4. Testing Inheritance Hierarchy & Source Display ---")
 
     # Clean existing test configs
     PayrollScheduleConfig.objects.filter(business=biz).delete()
 
-    # Step A: Enterprise Default (Monthly Calendar)
-    ent_cfg = PayrollScheduleService.save_schedule(
+    # Step A: Enterprise Default (MONTHLY, Generation Date 5)
+    PayrollScheduleService.save_schedule(
         scope=ScheduleConfigScope.ENTERPRISE,
         business=biz,
         data={
+            'generation_type': GenerationType.MONTHLY,
+            'generation_date': 5,
             'compensation_type': CompensationType.MONTHLY_SALARY,
-            'pay_frequency': PayFrequency.MONTHLY_CALENDAR,
-            'approval_required': True,
-            'payment_day_of_month': 7,
         },
         user=admin_user,
-        reason='Initial Enterprise Default Setup'
+        reason='Enterprise Default Monthly on 5th'
+    )
+
+    res_ent = PayrollScheduleService.resolve_schedule(employee=emp)
+    record_test(
+        "Employee Inherits Enterprise Default (Source: Enterprise Default)",
+        res_ent['source'] == 'ENTERPRISE' and
+        res_ent['source_display'] == 'Enterprise Default' and
+        res_ent['effective_config']['generation_type'] == GenerationType.MONTHLY and
+        res_ent['effective_config']['generation_date'] == 5,
+        f"source={res_ent['source']}, type={res_ent['effective_config']['generation_type']}"
+    )
+
+    # Step B: Centre Override (WEEKLY on Friday)
+    PayrollScheduleService.save_schedule(
+        scope=ScheduleConfigScope.CENTRE,
+        business=biz,
+        centre=emp.branch,
+        data={
+            'generation_type': GenerationType.WEEKLY,
+            'generation_weekday': 4,  # Friday
+        },
+        user=admin_user,
+        reason='Centre Override Weekly on Friday'
+    )
+
+    res_cen = PayrollScheduleService.resolve_schedule(employee=emp)
+    record_test(
+        "Employee Inherits Centre Override (Source: Centre Override)",
+        res_cen['source'] == 'CENTRE' and
+        res_cen['source_display'] == 'Centre Override' and
+        res_cen['effective_config']['generation_type'] == GenerationType.WEEKLY and
+        res_cen['effective_config']['generation_weekday'] == 4,
+        f"source={res_cen['source']}, weekday={res_cen['effective_config']['generation_weekday']}"
+    )
+
+    # Step C: Employee Override (DAILY)
+    PayrollScheduleService.save_schedule(
+        scope=ScheduleConfigScope.EMPLOYEE,
+        business=biz,
+        employee=emp,
+        data={
+            'generation_type': GenerationType.DAILY,
+        },
+        user=admin_user,
+        reason='Employee Override Daily'
     )
 
     res_emp = PayrollScheduleService.resolve_schedule(employee=emp)
     record_test(
-        "Employee Inherits Enterprise Default When No Overrides Exist",
-        res_emp['source'] == 'ENTERPRISE' and res_emp['effective_config']['pay_frequency'] == PayFrequency.MONTHLY_CALENDAR,
-        f"source={res_emp['source']}"
+        "Employee Override Takes Highest Precedence (Source: Employee Override)",
+        res_emp['source'] == 'EMPLOYEE' and
+        res_emp['source_display'] == 'Employee Override' and
+        res_emp['effective_config']['generation_type'] == GenerationType.DAILY,
+        f"source={res_emp['source']}, type={res_emp['effective_config']['generation_type']}"
     )
 
-    # Step B: Centre Override (Weekly)
-    PayrollScheduleService.save_schedule(
-        scope=ScheduleConfigScope.CENTRE,
-        business=biz,
-        centre=centre_a,
-        data={
-            'pay_frequency': PayFrequency.WEEKLY,
-            'week_start_day': 0,
-        },
-        user=admin_user,
-        reason='Centre A Weekly Settlement Override'
-    )
+    # ------------------------------------------------------------------
+    # 5. REVERTING OVERRIDE (Disable Override with History Preservation)
+    # ------------------------------------------------------------------
+    print("\n--- 5. Testing Disabling Override & Restoring Parent Hierarchy ---")
 
-    emp.branch = centre_a
-    emp.save(update_fields=['branch'])
+    hist_count_before = PayrollScheduleHistory.objects.filter(employee=emp).count()
 
-    res_emp_centre = PayrollScheduleService.resolve_schedule(employee=emp)
-    record_test(
-        "Employee Inherits Centre Override When Centre Has Custom Schedule",
-        res_emp_centre['source'] == 'CENTRE' and res_emp_centre['effective_config']['pay_frequency'] == PayFrequency.WEEKLY,
-        f"source={res_emp_centre['source']}, freq={res_emp_centre['effective_config']['pay_frequency']}"
-    )
-
-    # Step C: Employee Specific Override (Daily Wage)
-    PayrollScheduleService.save_schedule(
-        scope=ScheduleConfigScope.EMPLOYEE,
-        business=biz,
-        centre=centre_a,
-        employee=emp,
-        data={
-            'compensation_type': CompensationType.DAILY_WAGE,
-            'pay_frequency': PayFrequency.WEEKLY,
-            'payment_rule': PaymentScheduleRule.SPECIFIED_WEEKDAY,
-            'payment_weekday': 4,
-        },
-        user=admin_user,
-        reason='Employee Specific Daily Wage Override'
-    )
-
-    res_emp_custom = PayrollScheduleService.resolve_schedule(employee=emp)
-    record_test(
-        "Employee Uses Custom Employee Override When Configured",
-        res_emp_custom['source'] == 'EMPLOYEE' and res_emp_custom['effective_config']['compensation_type'] == CompensationType.DAILY_WAGE,
-        f"source={res_emp_custom['source']}, comp_type={res_emp_custom['effective_config']['compensation_type']}"
-    )
-
-    # Step D: Reset Employee Override to inherit Centre Default
     PayrollScheduleService.reset_override(
         scope=ScheduleConfigScope.EMPLOYEE,
         business=biz,
-        centre=centre_a,
         employee=emp,
         user=admin_user,
-        reason='Reverted employee to centre defaults'
+        reason='Reverted employee override to inherit centre default'
     )
 
-    res_emp_reverted = PayrollScheduleService.resolve_schedule(employee=emp)
+    res_reverted = PayrollScheduleService.resolve_schedule(employee=emp)
+    hist_count_after = PayrollScheduleHistory.objects.filter(employee=emp).count()
+
     record_test(
-        "Resetting Employee Override Restores Centre Default Inheritance",
-        res_emp_reverted['source'] == 'CENTRE' and res_emp_reverted['has_override'] is True and res_emp_reverted['effective_config']['pay_frequency'] == PayFrequency.WEEKLY,
-        f"source={res_emp_reverted['source']}"
+        "Reverting Employee Override Restores Centre Inheritance Cleanly",
+        res_reverted['source'] == 'CENTRE' and
+        (res_reverted.get('employee_override') is None or res_reverted['employee_override']['has_override'] is False) and
+        res_reverted['effective_config']['generation_type'] == GenerationType.WEEKLY,
+        f"source={res_reverted['source']}, type={res_reverted['effective_config']['generation_type']}"
     )
 
-    # Verify History was preserved
-    hist_count = PayrollScheduleHistory.objects.filter(employee=emp).count()
     record_test(
-        "Historical Config Snapshots Preserved In PayrollScheduleHistory",
-        hist_count >= 1,
-        f"history_count={hist_count}"
+        "Disabling Override Preserves Historical Snapshot In History Table",
+        hist_count_after > hist_count_before,
+        f"history_records={hist_count_after}"
     )
 
     # ------------------------------------------------------------------
-    # 5. COMPENSATION TYPES IN PAYROLL CALCULATION ENGINE
+    # 6. BACKEND VALIDATION ENFORCEMENT
     # ------------------------------------------------------------------
-    print("\n--- 5. Testing Compensation Types in Payroll Engine ---")
+    print("\n--- 6. Testing Backend Validation Rules ---")
 
-    # Ensure revision exists for basic_salary = 30000 (effective on or after latest revision)
-    # Clear any previous revisions for this employee in the test month to ensure deterministic base rate
-    SalaryRevision.objects.filter(employee=emp, effective_from__gte=datetime.date(2026, 10, 1)).delete()
-    SalaryRevision.objects.create(
-        business=biz,
-        employee=emp,
-        basic_salary=Decimal('30000.00'),
-        hourly_rate=Decimal('150.00'),
-        effective_from=datetime.date(2026, 10, 1),
-        reason='Standard compensation benchmark'
-    )
+    # Invalid generation type
+    invalid_type_err = False
+    try:
+        PayrollScheduleService.save_schedule(
+            scope=ScheduleConfigScope.EMPLOYEE,
+            business=biz,
+            employee=emp,
+            data={'generation_type': 'ANNUALLY'},
+            user=admin_user
+        )
+    except (DjangoValidationError, DRFValidationError):
+        invalid_type_err = True
 
-    # Test Monthly Salary Calculation
-    PayrollScheduleService.save_schedule(
-        scope=ScheduleConfigScope.EMPLOYEE,
-        business=biz,
-        centre=centre_a,
-        employee=emp,
-        data={'compensation_type': CompensationType.MONTHLY_SALARY},
-        user=admin_user
-    )
-    calc_monthly = PayrollCalculationService.calculate_employee_payroll(emp, datetime.date(2026, 10, 1), datetime.date(2026, 10, 31))
-    record_test(
-        "Monthly Salary Uses Full Monthly Base Amount",
-        calc_monthly['gross_amount'] >= Decimal('30000.00'),
-        f"gross={calc_monthly['gross_amount']}"
-    )
+    record_test("Invalid Generation Type Rejected by Backend", invalid_type_err)
 
-    # Test Daily Wage Calculation: ₹1000/day * paid days
-    PayrollScheduleService.save_schedule(
-        scope=ScheduleConfigScope.EMPLOYEE,
-        business=biz,
-        centre=centre_a,
-        employee=emp,
-        data={'compensation_type': CompensationType.DAILY_WAGE},
-        user=admin_user
-    )
-    calc_daily = PayrollCalculationService.calculate_employee_payroll(emp, datetime.date(2026, 10, 1), datetime.date(2026, 10, 31))
-    daily_line = next((l for l in calc_daily['line_items'] if 'Daily Wages' in l['name']), None)
-    record_test(
-        "Daily Wage Calculation Generates Itemized Payable Days Line Item",
-        daily_line is not None and daily_line['rate'] == Decimal('1000.00'),
-        f"line_name={daily_line['name'] if daily_line else None}, rate={daily_line['rate'] if daily_line else None}"
-    )
+    # Invalid weekday (e.g. 7 or -1)
+    invalid_weekday_err = False
+    try:
+        PayrollScheduleService.save_schedule(
+            scope=ScheduleConfigScope.EMPLOYEE,
+            business=biz,
+            employee=emp,
+            data={'generation_type': GenerationType.WEEKLY, 'generation_weekday': 9},
+            user=admin_user
+        )
+    except (DjangoValidationError, DRFValidationError):
+        invalid_weekday_err = True
+
+    record_test("Invalid Generation Weekday (>6) Rejected by Backend", invalid_weekday_err)
+
+    # Invalid monthly date (e.g. 35 or 0)
+    invalid_date_err = False
+    try:
+        PayrollScheduleService.save_schedule(
+            scope=ScheduleConfigScope.EMPLOYEE,
+            business=biz,
+            employee=emp,
+            data={'generation_type': GenerationType.MONTHLY, 'generation_date': 35},
+            user=admin_user
+        )
+    except (DjangoValidationError, DRFValidationError):
+        invalid_date_err = True
+
+    record_test("Invalid Monthly Generation Date (>31) Rejected by Backend", invalid_date_err)
 
     # ------------------------------------------------------------------
-    # 6. HISTORICAL PAYROLL IMMUTABILITY PROTECTION
+    # 7. DUPLICATE PREVENTION & HISTORICAL IMMUTABILITY
     # ------------------------------------------------------------------
-    print("\n--- 6. Testing Finalized Payroll Protection & Immutability ---")
+    print("\n--- 7. Testing Duplicate Prevention & Historical Payroll Immutability ---")
 
-    test_p_start = datetime.date(2026, 9, 1)
-    test_p_end = datetime.date(2026, 9, 30)
+    period_start = datetime.date(2026, 8, 1)
+    period_end = datetime.date(2026, 8, 31)
 
-    # Clean up any existing September run from prior test runs so test is fully idempotent
-    from apps.payroll.models import Payroll
-    prior_runs = PayrollRun.objects.filter(business=biz, period_start=test_p_start, period_end=test_p_end)
-    Payroll.objects.filter(payroll_run__in=prior_runs).delete()
-    prior_runs.delete()
+    # Clean up any preexisting test run for this period to ensure idempotency
+    Payroll.objects.filter(payroll_run__business=biz, payroll_run__period_start=period_start, payroll_run__period_end=period_end).delete()
+    PayrollRun.objects.filter(business=biz, period_start=period_start, period_end=period_end).delete()
 
-    # Run batch payroll for September
-    sep_run = PayrollCalculationService.run_batch_payroll(
+    # Generate initial payroll run
+    run1 = PayrollCalculationService.run_batch_payroll(
         business=biz,
-        period_start=test_p_start,
-        period_end=test_p_end,
-        centre=centre_a,
+        period_start=period_start,
+        period_end=period_end,
+        centre=None,
         approved_by=admin_user
     )
 
-    # Finalize September Run
-    sep_run.status = PayrollRunStatus.APPROVED
-    sep_run.save()
-    sep_run.status = PayrollRunStatus.FINALIZED
-    sep_run.finalized_at = timezone.now()
-    sep_run.save()
+    # Finalize run
+    run1.status = PayrollRunStatus.FINALIZED
+    run1.finalized_at = timezone.now()
+    run1.save()
 
-    # Attempting to re-run or recalculate finalized run MUST raise ValidationError
-    recalc_blocked = False
+    # Attempt to recalculate the same period
+    finalized_blocked = False
     try:
         PayrollCalculationService.run_batch_payroll(
             business=biz,
-            period_start=test_p_start,
-            period_end=test_p_end,
-            centre=centre_a,
+            period_start=period_start,
+            period_end=period_end,
+            centre=None,
             approved_by=admin_user
         )
-    except ValidationError:
-        recalc_blocked = True
+    except (DRFValidationError, DjangoValidationError) as e:
+        if 'FINALIZED' in str(e):
+            finalized_blocked = True
 
-    record_test(
-        "Recalculation of FINALIZED Payroll Run Is Strictly Blocked",
-        recalc_blocked,
-        "ValidationError raised on attempt to overwrite finalized run"
-    )
+    record_test("Recalculation of FINALIZED Payroll Run Is Strictly Blocked", finalized_blocked)
 
-    # ------------------------------------------------------------------
-    # 7. AUTOMATIC DRAFT GENERATION SAFETY
-    # ------------------------------------------------------------------
-    print("\n--- 7. Testing Automatic Draft Generation Safety ---")
-
-    # Set Enterprise schedule to AUTOMATIC_DRAFT_AFTER_PERIOD_END
+    # Changing generation schedule does not mutate finalized payroll
     PayrollScheduleService.save_schedule(
         scope=ScheduleConfigScope.ENTERPRISE,
         business=biz,
-        data={
-            'generation_mode': PayrollGenerationMode.AUTOMATIC_DRAFT_AFTER_PERIOD_END,
-            'generation_delay_days': 1
-        },
-        user=admin_user
+        data={'generation_type': GenerationType.WEEKLY, 'generation_weekday': 1},
+        user=admin_user,
+        reason='Testing historical isolation'
+    )
+    run1.refresh_from_db()
+    record_test(
+        "Finalized Payroll Run Remains Unmutated After Schedule Change",
+        run1.status == PayrollRunStatus.FINALIZED and run1.period_start == period_start,
+        f"status={run1.status}"
     )
 
-    # Test draft generation for completed August period
-    prior_aug = PayrollRun.objects.filter(business=biz, period_start=datetime.date(2026, 8, 1), period_end=datetime.date(2026, 8, 31))
-    Payroll.objects.filter(payroll_run__in=prior_aug).delete()
-    prior_aug.delete()
-
-    aug_runs = PayrollScheduleService.process_scheduled_drafts(
-        business=biz,
-        as_of_date=datetime.date(2026, 9, 2)
-    )
-
-    for r in aug_runs:
-        record_test(
-            "Scheduled Generation Produces DRAFT Status Only (Never Finalized or Paid)",
-            r.status == PayrollRunStatus.DRAFT,
-            f"run_status={r.status}"
-        )
-
     # ------------------------------------------------------------------
-    # 8. REST API ENDPOINTS & RBAC ACCESS CONTROL
+    # 8. REST API ENDPOINTS & RBAC PERMISSION ENFORCEMENT
     # ------------------------------------------------------------------
-    print("\n--- 8. Testing REST APIs & Granular RBAC Permissions ---")
+    print("\n--- 8. Testing REST APIs & RBAC Permissions ---")
 
     factory = APIRequestFactory()
 
-    # GET /api/v1/employees/<id>/payroll-schedule/
+    # GET employee schedule
     req_get = factory.get(f'/api/v1/employees/{emp.id}/payroll-schedule/')
     force_authenticate(req_get, user=admin_user)
     resp_get = EmployeePayrollScheduleView.as_view()(req_get, pk=str(emp.id))
     record_test(
-        "API GET Employee Payroll Schedule Returns 200 with Source & Resolution",
-        resp_get.status_code == 200 and 'effective_config' in resp_get.data and 'source' in resp_get.data,
-        f"status={resp_get.status_code}, source={resp_get.data.get('source')}"
+        "API GET Employee Payroll Schedule Resolves Correctly",
+        resp_get.status_code == 200 and 'effective_config' in resp_get.data,
+        f"status={resp_get.status_code}"
     )
 
-    # POST /api/v1/employees/<id>/payroll-schedule/
+    # POST employee schedule as Admin (Allowed)
     req_post = factory.post(
         f'/api/v1/employees/{emp.id}/payroll-schedule/',
         data={
-            'compensation_type': 'DAILY_WAGE',
-            'pay_frequency': 'WEEKLY',
-            'change_reason': 'Updated via API acceptance test'
+            'generation_type': 'WEEKLY',
+            'generation_weekday': 2,  # Wednesday
+            'change_reason': 'Configured via API acceptance test'
         },
         format='json'
     )
     force_authenticate(req_post, user=admin_user)
     resp_post = EmployeePayrollScheduleView.as_view()(req_post, pk=str(emp.id))
     record_test(
-        "API POST Employee Payroll Schedule Saves Override Successfully",
-        resp_post.status_code == 200 and resp_post.data['effective_config']['compensation_type'] == 'DAILY_WAGE',
+        "API POST Employee Schedule Override By Admin Succeeds",
+        resp_post.status_code == 200 and resp_post.data['effective_config']['generation_type'] == 'WEEKLY',
         f"status={resp_post.status_code}"
     )
 
-    # POST /api/v1/employees/<id>/payroll-schedule/reset/
+    # POST employee schedule as Unauthorized Staff (Blocked)
+    if staff_user:
+        req_unauth = factory.post(
+            f'/api/v1/employees/{emp.id}/payroll-schedule/',
+            data={'generation_type': 'DAILY', 'change_reason': 'Unauthorized hack'},
+            format='json'
+        )
+        force_authenticate(req_unauth, user=staff_user)
+        resp_unauth_blocked = False
+        try:
+            resp_unauth = EmployeePayrollScheduleView.as_view()(req_unauth, pk=str(emp.id))
+            if resp_unauth.status_code == 403:
+                resp_unauth_blocked = True
+        except PermissionDenied:
+            resp_unauth_blocked = True
+
+        record_test("RBAC: Unauthorized Staff Blocked From Modifying Salary Schedule", resp_unauth_blocked)
+
+    # POST Reset Employee Schedule via API
     req_reset = factory.post(
         f'/api/v1/employees/{emp.id}/payroll-schedule/reset/',
-        data={'change_reason': 'Resetting via API acceptance test'},
+        data={'change_reason': 'Resetting override via API'},
         format='json'
     )
     force_authenticate(req_reset, user=admin_user)
     resp_reset = EmployeePayrollScheduleResetView.as_view()(req_reset, pk=str(emp.id))
     record_test(
-        "API POST Employee Schedule Reset Reverts to Parent Default",
-        resp_reset.status_code == 200 and resp_reset.data['source'] in ['CENTRE', 'ENTERPRISE'],
-        f"status={resp_reset.status_code}, source={resp_reset.data.get('source')}"
+        "API POST Reset Reverts Employee Override to Parent Configuration",
+        resp_reset.status_code == 200 and resp_reset.data['employee_override']['has_override'] is False,
+        f"source={resp_reset.data.get('source')}"
+    )
+
+    # ------------------------------------------------------------------
+    # 9. SECTION 1 & 2 SYNCHRONIZATION & REVISION HISTORY UNIT IMMUTABILITY
+    # ------------------------------------------------------------------
+    print("\n--- 9. Testing Section 1 & 2 Synchronization & Salary Revision Units ---")
+
+    # Ensure baseline employee has active salary revision
+    baseline_salary = Decimal('30000.00')
+    emp_rev = SalaryRevision.objects.filter(employee=emp).order_by('-effective_from').first()
+    if not emp_rev:
+        emp_rev = SalaryRevision.objects.create(
+            business=biz,
+            employee=emp,
+            effective_from=datetime.date(2026, 1, 1),
+            basic_salary=baseline_salary,
+            salary_unit='MONTHLY',
+            currency='INR',
+            reason='Initial baseline salary'
+        )
+    else:
+        emp_rev.basic_salary = baseline_salary
+        emp_rev.salary_unit = 'MONTHLY'
+        emp_rev.save()
+
+    # 9.1 Monthly Employee
+    PayrollScheduleService.save_schedule(
+        scope=ScheduleConfigScope.EMPLOYEE,
+        business=biz,
+        employee=emp,
+        data={'generation_type': GenerationType.MONTHLY, 'generation_date': 5},
+        user=admin_user,
+        reason='Test Monthly Synchronization'
+    )
+    res_monthly = PayrollScheduleService.resolve_schedule(employee=emp)
+    unit_monthly = '/ day' if res_monthly['effective_config']['generation_type'] == 'DAILY' else (
+        '/ week' if res_monthly['effective_config']['generation_type'] == 'WEEKLY' else '/ month'
+    )
+    emp_rev.refresh_from_db()
+    record_test(
+        "MONTHLY: Section 1 Derives '/ month' and Stored Amount Remains Unchanged",
+        unit_monthly == '/ month' and emp_rev.basic_salary == baseline_salary and res_monthly['source'] == 'EMPLOYEE',
+        f"unit={unit_monthly}, basic_salary={emp_rev.basic_salary}"
+    )
+
+    # 9.2 Weekly Employee
+    PayrollScheduleService.save_schedule(
+        scope=ScheduleConfigScope.EMPLOYEE,
+        business=biz,
+        employee=emp,
+        data={'generation_type': GenerationType.WEEKLY, 'generation_weekday': 4},
+        user=admin_user,
+        reason='Test Weekly Synchronization'
+    )
+    res_weekly = PayrollScheduleService.resolve_schedule(employee=emp)
+    unit_weekly = '/ day' if res_weekly['effective_config']['generation_type'] == 'DAILY' else (
+        '/ week' if res_weekly['effective_config']['generation_type'] == 'WEEKLY' else '/ month'
+    )
+    emp_rev.refresh_from_db()
+    record_test(
+        "WEEKLY: Section 1 Derives '/ week' and Stored Amount Remains Exactly ₹30,000",
+        unit_weekly == '/ week' and emp_rev.basic_salary == baseline_salary and res_weekly['source'] == 'EMPLOYEE',
+        f"unit={unit_weekly}, basic_salary={emp_rev.basic_salary}"
+    )
+
+    # 9.3 Daily Employee
+    PayrollScheduleService.save_schedule(
+        scope=ScheduleConfigScope.EMPLOYEE,
+        business=biz,
+        employee=emp,
+        data={'generation_type': GenerationType.DAILY},
+        user=admin_user,
+        reason='Test Daily Synchronization'
+    )
+    res_daily = PayrollScheduleService.resolve_schedule(employee=emp)
+    unit_daily = '/ day' if res_daily['effective_config']['generation_type'] == 'DAILY' else (
+        '/ week' if res_daily['effective_config']['generation_type'] == 'WEEKLY' else '/ month'
+    )
+    emp_rev.refresh_from_db()
+    record_test(
+        "DAILY: Section 1 Derives '/ day' and Stored Amount Remains Exactly ₹30,000",
+        unit_daily == '/ day' and emp_rev.basic_salary == baseline_salary and res_daily['source'] == 'EMPLOYEE',
+        f"unit={unit_daily}, basic_salary={emp_rev.basic_salary}"
+    )
+
+    # 9.4 Centre-level Override Synchronization
+    if centre_a:
+        PayrollScheduleService.save_schedule(
+            scope=ScheduleConfigScope.CENTRE,
+            business=biz,
+            centre=centre_a,
+            data={'generation_type': GenerationType.WEEKLY, 'generation_weekday': 2},
+            user=admin_user,
+            reason='Centre override weekly'
+        )
+        emp.branch = centre_a
+        emp.save()
+
+        # Reset employee override
+        PayrollScheduleService.reset_override(
+            scope=ScheduleConfigScope.EMPLOYEE,
+            business=biz,
+            employee=emp,
+            user=admin_user,
+            reason='Inherit centre override'
+        )
+        res_centre = PayrollScheduleService.resolve_schedule(employee=emp)
+        unit_centre = '/ day' if res_centre['effective_config']['generation_type'] == 'DAILY' else (
+            '/ week' if res_centre['effective_config']['generation_type'] == 'WEEKLY' else '/ month'
+        )
+        record_test(
+            "CENTRE OVERRIDE: Section 1 Inherits '/ week' and Source Displays Centre Override",
+            res_centre['source'] == 'CENTRE' and unit_centre == '/ week',
+            f"source={res_centre['source']}, unit={unit_centre}"
+        )
+
+    # 9.5 Reset to Enterprise Default
+    PayrollScheduleService.save_schedule(
+        scope=ScheduleConfigScope.ENTERPRISE,
+        business=biz,
+        data={'generation_type': GenerationType.MONTHLY, 'generation_date': 1},
+        user=admin_user,
+        reason='Reset enterprise default to monthly'
+    )
+    if centre_a:
+        PayrollScheduleService.reset_override(
+            scope=ScheduleConfigScope.CENTRE,
+            business=biz,
+            centre=centre_a,
+            user=admin_user,
+            reason='Reset centre override to enterprise default'
+        )
+    res_ent = PayrollScheduleService.resolve_schedule(employee=emp)
+    unit_ent = '/ day' if res_ent['effective_config']['generation_type'] == 'DAILY' else (
+        '/ week' if res_ent['effective_config']['generation_type'] == 'WEEKLY' else '/ month'
+    )
+    record_test(
+        "RESET TO ENTERPRISE: Section 1 & Section 2 Synchronously Display Enterprise Default",
+        res_ent['source'] == 'ENTERPRISE' and unit_ent == '/ month',
+        f"source={res_ent['source']}, unit={unit_ent}"
+    )
+
+    # 9.6 Salary Revision History Unit Immutability
+    req_comp = factory.get(f'/api/v1/employees/{emp.id}/salary-comparison/')
+    force_authenticate(req_comp, user=admin_user)
+    resp_comp = EmployeeSalaryComparisonView.as_view()(req_comp, pk=str(emp.id))
+    has_monthly_unit = any(
+        c.get('salary_unit') == 'MONTHLY' and c.get('salary_unit_display') == '/ month'
+        for c in resp_comp.data.get('comparisons', [])
+    )
+    record_test(
+        "REVISION HISTORY: Historical Revision Retains '/ month' In Comparisons API",
+        resp_comp.status_code == 200 and has_monthly_unit,
+        f"comparisons_count={len(resp_comp.data.get('comparisons', []))}"
+    )
+
+    # 9.7 Switch Generation Frequency & Verify Historical Revisions Remain Unrelabeled
+    PayrollScheduleService.save_schedule(
+        scope=ScheduleConfigScope.EMPLOYEE,
+        business=biz,
+        employee=emp,
+        data={'generation_type': GenerationType.WEEKLY, 'generation_weekday': 5},
+        user=admin_user,
+        reason='Switch to Weekly'
+    )
+    req_comp_after = factory.get(f'/api/v1/employees/{emp.id}/salary-comparison/')
+    force_authenticate(req_comp_after, user=admin_user)
+    resp_comp_after = EmployeeSalaryComparisonView.as_view()(req_comp_after, pk=str(emp.id))
+    still_has_monthly_unit = any(
+        c.get('revision_id') == str(emp_rev.id) and c.get('salary_unit') == 'MONTHLY' and c.get('salary_unit_display') == '/ month'
+        for c in resp_comp_after.data.get('comparisons', [])
+    )
+    record_test(
+        "HISTORICAL IMMUTABILITY: Changing Current Frequency to Weekly Does NOT Relabel Historical Revisions",
+        still_has_monthly_unit,
+        f"historical_unit={emp_rev.salary_unit}"
+    )
+
+    # 9.8 Failed Configuration Save Leaves Authoritative State Unmodified
+    save_failed = False
+    try:
+        PayrollScheduleService.save_schedule(
+            scope=ScheduleConfigScope.EMPLOYEE,
+            business=biz,
+            employee=emp,
+            data={'generation_type': GenerationType.MONTHLY, 'generation_date': 99},
+            user=admin_user,
+            reason='Illegal save attempt'
+        )
+    except (DjangoValidationError, DRFValidationError):
+        save_failed = True
+
+    res_after_fail = PayrollScheduleService.resolve_schedule(employee=emp)
+    record_test(
+        "FAILED SAVE SAFETY: Rejected Backend Save Leaves Effective Schedule Unmutated",
+        save_failed and res_after_fail['effective_config']['generation_type'] == GenerationType.WEEKLY,
+        f"effective_type={res_after_fail['effective_config']['generation_type']}"
+    )
+
+    # 9.9 Calculation Regression Check: Label Display Does Not Affect Calculations
+    p_calc_monthly = PayrollCalculationService.calculate_employee_payroll(
+        employee=emp,
+        period_start=datetime.date(2026, 11, 1),
+        period_end=datetime.date(2026, 11, 30)
+    )
+    calc_base_amt = p_calc_monthly['salary_snapshot']['basic_salary']
+    record_test(
+        "CALCULATION ISOLATION: 30-Day Monthly Calculation Correctly Yields ₹30,000 Base",
+        calc_base_amt == 30000.0 and p_calc_monthly['gross_amount'] >= Decimal('30000.00'),
+        f"calc_base={calc_base_amt}, gross={p_calc_monthly['gross_amount']}"
     )
 
     # ------------------------------------------------------------------
@@ -422,7 +686,7 @@ def run_schedule_tests():
             print(f"FAILED: {f[0]} -> {f[1]}")
         sys.exit(1)
     else:
-        print("ALL PAYROLL SCHEDULE ACCEPTANCE TESTS COMPLETED SUCCESSFULLY WITH ZERO ERRORS!")
+        print("ALL SIMPLIFIED SALARY GENERATION ACCEPTANCE TESTS PASSED WITH ZERO ERRORS!")
 
 
 if __name__ == '__main__':

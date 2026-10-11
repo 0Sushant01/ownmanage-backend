@@ -17,13 +17,14 @@ from apps.attendance.views import (
     AttendanceTodayView, AttendanceCheckInView, AttendanceCheckOutView,
     AttendanceHistoryView, AttendanceCalendarView, AttendanceDailyRegisterView,
     AttendanceRecordDetailView, AttendanceRecordOverrideView, AttendanceQRTokenView,
+    AttendanceQRRevokeView,
     AttendanceMonthlyRegisterView,
     WorkScheduleListView, AttendanceCorrectionListCreateView,
     AttendanceCorrectionApproveView, AttendanceCorrectionRejectView
 )
 from apps.leaves.views import (
     LeaveTypeListView, LeaveRequestListCreateView,
-    LeaveRequestApproveView, LeaveRequestRejectView
+    LeaveRequestApproveView, LeaveRequestRejectView, LeaveRequestStatusUpdateView
 )
 from apps.payroll.views import (
     PayrollListView, PayrollDetailView
@@ -47,13 +48,15 @@ from apps.organization.access_views import (
 )
 from apps.attendance.policy_views import (
     EnterpriseAttendancePolicyView, CentreAttendancePolicyView, CentreAttendancePolicyResetView,
-    EmployeeWorkingHoursView
+    EmployeeWorkingHoursView, EmployeeWorkingHoursResetView
 )
 from apps.payroll.revision_views import (
-    EmployeeSalaryRevisionListCreateView, PayrollRunListCreateView,
-    PayrollRunApproveView, PayrollRunFinalizeView,
+    EmployeeSalaryRevisionListCreateView, EmployeeSalaryRevisionDetailView, PayrollRunListCreateView,
+    PayrollRunApproveView, PayrollRunFinalizeView, PayrollRunReleaseView, PayrollRunAdjustView,
+    PayrollRecordAdjustView, PayrollRunExceptionsView, PayrollExceptionReviewView,
     EmployeeSalaryComparisonView, EmployeeCompensationItemListCreateView,
-    EmployeeCompensationItemDetailView
+    EmployeeCompensationItemDetailView, CentreCompensationItemListCreateView,
+    EnterpriseCompensationItemListCreateView
 )
 from apps.payroll.schedule_views import (
     EmployeePayrollScheduleView, EmployeePayrollScheduleResetView,
@@ -126,6 +129,7 @@ urlpatterns = [
     path('centres/<uuid:pk>/attendance-policy/reset/', CentreAttendancePolicyResetView.as_view(), name='api-centre-attendance-policy-reset'),
     path('centres/<uuid:pk>/payroll-schedule/', CentrePayrollScheduleView.as_view(), name='api-centre-payroll-schedule'),
     path('centres/<uuid:pk>/payroll-schedule/reset/', CentrePayrollScheduleResetView.as_view(), name='api-centre-payroll-schedule-reset'),
+    path('centres/<uuid:pk>/compensation-items/', CentreCompensationItemListCreateView.as_view(), name='api-centre-comp-items'),
 
     # Departments & Designations
     path('departments/', DepartmentListCreateView.as_view(), name='api-departments'),
@@ -144,12 +148,15 @@ urlpatterns = [
     path('employees/<uuid:pk>/documents/', EmployeeDocumentListCreateView.as_view(), name='api-employee-documents'),
     path('employees/<uuid:pk>/activity/', EmployeeActivityLogView.as_view(), name='api-employee-activity'),
     path('employees/<uuid:pk>/salary-revisions/', EmployeeSalaryRevisionListCreateView.as_view(), name='api-employee-salary-revisions'),
+    path('employees/<uuid:pk>/salary-revisions/<uuid:rev_pk>/', EmployeeSalaryRevisionDetailView.as_view(), name='api-employee-salary-revision-detail'),
     path('employees/<uuid:pk>/salary-comparison/', EmployeeSalaryComparisonView.as_view(), name='api-employee-salary-comparison'),
     path('employees/<uuid:pk>/compensation-items/', EmployeeCompensationItemListCreateView.as_view(), name='api-employee-comp-items'),
     path('employees/<uuid:pk>/compensation-items/<uuid:comp_pk>/', EmployeeCompensationItemDetailView.as_view(), name='api-employee-comp-item-detail'),
     path('employees/<uuid:pk>/payroll-schedule/', EmployeePayrollScheduleView.as_view(), name='api-employee-payroll-schedule'),
     path('employees/<uuid:pk>/payroll-schedule/reset/', EmployeePayrollScheduleResetView.as_view(), name='api-employee-payroll-schedule-reset'),
+    path('payroll/enterprise-compensation-items/', EnterpriseCompensationItemListCreateView.as_view(), name='api-enterprise-comp-items'),
     path('employees/<uuid:pk>/working-hours/', EmployeeWorkingHoursView.as_view(), name='api-employee-working-hours'),
+    path('employees/<uuid:pk>/working-hours/reset/', EmployeeWorkingHoursResetView.as_view(), name='api-employee-working-hours-reset'),
 
     # Documents
     path('documents/<uuid:pk>/', EmployeeDocumentDetailView.as_view(), name='api-document-detail'),
@@ -167,6 +174,7 @@ urlpatterns = [
     path('attendance/records/<uuid:pk>/', AttendanceRecordDetailView.as_view(), name='api-attendance-record-detail'),
     path('attendance/records/<uuid:pk>/override/', AttendanceRecordOverrideView.as_view(), name='api-attendance-record-override'),
     path('attendance/qr/centre-token/', AttendanceQRTokenView.as_view(), name='api-attendance-qr-token'),
+    path('attendance/qr/revoke/', AttendanceQRRevokeView.as_view(), name='api-attendance-qr-revoke'),
     path('attendance/today/', AttendanceTodayView.as_view(), name='api-attendance-today'),
     path('attendance/check-in/', AttendanceCheckInView.as_view(), name='api-attendance-checkin'),
     path('attendance/check-out/', AttendanceCheckOutView.as_view(), name='api-attendance-checkout'),
@@ -182,15 +190,21 @@ urlpatterns = [
     # Leaves
     path('leaves/types/', LeaveTypeListView.as_view(), name='api-leave-types'),
     path('leaves/requests/', LeaveRequestListCreateView.as_view(), name='api-leaves'),
+    path('leaves/requests/<uuid:pk>/status/', LeaveRequestStatusUpdateView.as_view(), name='api-leave-status-update'),
     path('leaves/requests/<uuid:pk>/approve/', LeaveRequestApproveView.as_view(), name='api-leave-approve'),
     path('leaves/requests/<uuid:pk>/reject/', LeaveRequestRejectView.as_view(), name='api-leave-reject'),
 
     # Salary & Payroll
     path('salary/payrolls/', PayrollListView.as_view(), name='api-salary-payrolls'),
     path('salary/payrolls/<uuid:pk>/', PayrollDetailView.as_view(), name='api-salary-detail'),
+    path('salary/payrolls/<uuid:pk>/adjust/', PayrollRecordAdjustView.as_view(), name='api-salary-payroll-adjust'),
     path('payroll/runs/', PayrollRunListCreateView.as_view(), name='api-payroll-runs'),
     path('payroll/runs/<uuid:pk>/approve/', PayrollRunApproveView.as_view(), name='api-payroll-run-approve'),
     path('payroll/runs/<uuid:pk>/finalize/', PayrollRunFinalizeView.as_view(), name='api-payroll-run-finalize'),
+    path('payroll/runs/<uuid:pk>/release/', PayrollRunReleaseView.as_view(), name='api-payroll-run-release'),
+    path('payroll/runs/<uuid:pk>/adjust/', PayrollRunAdjustView.as_view(), name='api-payroll-run-adjust'),
+    path('payroll/runs/<uuid:pk>/exceptions/', PayrollRunExceptionsView.as_view(), name='api-payroll-run-exceptions'),
+    path('payroll/exceptions/<uuid:pk>/review/', PayrollExceptionReviewView.as_view(), name='api-payroll-exception-review'),
     path('payroll/schedule-enterprise/', EnterprisePayrollScheduleView.as_view(), name='api-payroll-schedule-enterprise'),
     path('payroll/schedule-periods/', PayrollSchedulePeriodsPreviewView.as_view(), name='api-payroll-schedule-periods'),
 

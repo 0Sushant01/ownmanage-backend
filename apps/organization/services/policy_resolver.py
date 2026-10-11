@@ -125,6 +125,23 @@ class PolicyResolver:
                 effective[field] = ent_val
                 source[field] = 'enterprise' if is_ent_defined else 'system'
 
+        # Merge extra settings for attendance-to-payroll policies (Enterprise -> Centre override)
+        ent_extra = ent_policy.extra_settings if (ent_policy and ent_policy.extra_settings) else {}
+        ovr_extra = centre_override.extra_settings if (centre_override and centre_override.extra_settings) else {}
+        effective_extra = {
+            'late_deduction_enabled': True,
+            'late_deduction_fraction': 0.5,
+            'half_day_deduction_fraction': 0.5,
+            'holiday_work_multiplier': 1.0,
+            'weekly_off_work_multiplier': 1.0,
+            'absence_deduction_divisor': 30,
+            **ent_extra,
+            **ovr_extra
+        }
+        for k, v in effective_extra.items():
+            if k not in effective:
+                effective[k] = v
+
         # Special handling for GPS coordinates fallback to Branch record if unconfigured
         if centre:
             if effective.get('gps_latitude') is None and centre.latitude is not None:

@@ -463,6 +463,9 @@ class EmployeeDocumentDetailView(views.APIView):
 class EmployeeDocumentVerifyView(views.APIView):
     permission_classes = [IsAuthenticated]
 
+    def patch(self, request, pk):
+        return self.post(request, pk)
+
     def post(self, request, pk):
         doc = EmployeeDocument.objects.filter(id=pk, is_deleted=False).select_related('employee', 'business').first()
         if not doc:
@@ -472,12 +475,16 @@ class EmployeeDocumentVerifyView(views.APIView):
             raise PermissionDenied('You do not have permission to verify documents.')
 
         new_status = request.data.get('status', 'VERIFIED').upper()
-        if new_status not in ['VERIFIED', 'REJECTED']:
-            raise ValidationError({'detail': "Status must be either 'VERIFIED' or 'REJECTED'."})
+        if new_status not in ['VERIFIED', 'REJECTED', 'PENDING']:
+            raise ValidationError({'detail': "Status must be 'VERIFIED', 'REJECTED', or 'PENDING'."})
 
         doc.verification_status = new_status
-        doc.verified_by = request.user
-        doc.verified_at = timezone.now()
+        if new_status == 'PENDING':
+            doc.verified_by = None
+            doc.verified_at = None
+        else:
+            doc.verified_by = request.user
+            doc.verified_at = timezone.now()
         doc.remarks = request.data.get('remarks', doc.remarks)
         doc.save(update_fields=['verification_status', 'verified_by', 'verified_at', 'remarks', 'updated_at'])
 

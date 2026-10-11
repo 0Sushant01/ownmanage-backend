@@ -107,14 +107,19 @@ class AttendanceService:
                 raise ValidationError({'detail': 'QR Code attendance is disabled for this centre.'})
             if not qr_code:
                 raise ValidationError({'detail': 'QR code data is required for QR attendance.'})
-            # Validate QR code data
-            # Format: OWNMANAGE:CENTRE:<centre_id>:<optional_payload>
-            qr_content = str(qr_code).strip()
-            if centre:
-                expected_tag = f"OWNMANAGE:CENTRE:{centre.id}"
-                alt_tag = str(centre.id)
-                if expected_tag not in qr_content and alt_tag not in qr_content and f"CENTRE:{centre.id}" not in qr_content:
-                    raise ValidationError({'detail': 'Invalid QR code. The scanned QR does not match your assigned centre.'})
+            
+            from apps.attendance.services.qr_service import AttendanceQRService
+            qr_record = AttendanceQRService.validate_qr_token(
+                qr_code_input=qr_code,
+                employee=emp,
+                centre=centre,
+                server_now=server_now
+            )
+            qr_meta = {
+                'qr_verified': True,
+                'qr_code_id': str(qr_record.id),
+                'validity_period': qr_record.validity_period,
+            }
         elif method_str == AttendanceMethod.FACE:
             if not policy.get('allow_face_recognition', False):
                 raise ValidationError({'detail': 'Face recognition attendance is disabled for this centre.'})
@@ -150,7 +155,7 @@ class AttendanceService:
         }
 
         if method_str == AttendanceMethod.QR:
-            verification_metadata['qr_verified'] = True
+            verification_metadata.update(qr_meta)
         elif method_str == AttendanceMethod.FACE:
             verification_metadata.update(face_meta)
 
@@ -216,6 +221,26 @@ class AttendanceService:
                     'verification_metadata': verification_metadata
                 }
             )
+
+            # Strict Attendance Locking: Check if this day is locked or has an expired payroll editing window
+            if day.is_locked:
+                raise ValidationError({'detail': 'Attendance for this date is locked because the associated payroll period has been finalized.'})
+
+            from apps.payroll.models import Payroll, PayrollStatus
+            active_payroll = Payroll.objects.filter(
+                employee=emp,
+                period_start__lte=local_date,
+                period_end__gte=local_date
+            ).select_related('payroll_run').first()
+
+            if active_payroll:
+                if active_payroll.status in [PayrollStatus.FINALIZED, PayrollStatus.RELEASED, PayrollStatus.PAID]:
+                    raise ValidationError({'detail': 'Attendance for this date is locked because the associated payroll period has been finalized.'})
+                now = timezone.now()
+                if active_payroll.editing_deadline and now > active_payroll.editing_deadline:
+                    raise ValidationError({'detail': 'Attendance for this date is locked because the payroll editing window has expired.'})
+                if active_payroll.payroll_run and active_payroll.payroll_run.editing_deadline and now > active_payroll.payroll_run.editing_deadline:
+                    raise ValidationError({'detail': 'Attendance for this date is locked because the payroll editing window has expired.'})
 
             # Ensure centre is set
             if not day.centre and centre:
@@ -356,6 +381,25 @@ class AttendanceService:
         """
         if not reason or not reason.strip():
             raise ValidationError({'detail': 'A valid reason is required for manual attendance override.'})
+
+        if attendance_day.is_locked:
+            raise ValidationError({'detail': 'Attendance for this date is locked because the associated payroll period has been finalized. Please submit an attendance correction request.'})
+
+        from apps.payroll.models import Payroll, PayrollStatus
+        active_payroll = Payroll.objects.filter(
+            employee=attendance_day.employee,
+            period_start__lte=attendance_day.attendance_date,
+            period_end__gte=attendance_day.attendance_date
+        ).select_related('payroll_run').first()
+
+        if active_payroll:
+            if active_payroll.status in [PayrollStatus.FINALIZED, PayrollStatus.RELEASED, PayrollStatus.PAID]:
+                raise ValidationError({'detail': 'Attendance for this date is locked because the associated payroll has been finalized. Please submit an attendance correction request.'})
+            now = timezone.now()
+            if active_payroll.editing_deadline and now > active_payroll.editing_deadline:
+                raise ValidationError({'detail': f'Attendance for this date is locked because the payroll editing window closed on {active_payroll.editing_deadline}.'})
+            if active_payroll.payroll_run and active_payroll.payroll_run.editing_deadline and now > active_payroll.payroll_run.editing_deadline:
+                raise ValidationError({'detail': f'Attendance for this date is locked because the payroll editing window closed on {active_payroll.payroll_run.editing_deadline}.'})
 
         # Capture old state for audit
         old_data = {

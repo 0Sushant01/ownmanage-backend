@@ -1,3 +1,5 @@
+from django.db.models import Q
+from django.utils import timezone
 from rest_framework import views, status
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -5,7 +7,7 @@ from rest_framework.exceptions import PermissionDenied, NotFound
 
 from apps.core.permissions import get_user_context
 from apps.organization.models import BusinessRole
-from apps.payroll.models import Payroll
+from apps.payroll.models import Payroll, PayrollStatus, SalarySlipVisibilityPolicy
 from apps.payroll.serializers import PayrollSerializer
 
 
@@ -35,9 +37,22 @@ class PayrollListView(views.APIView):
             else:
                 qs = Payroll.objects.none()
         else:
-            # Staff sees only own payroll records
+            # Staff sees only own released / visible payroll records per visibility policy
             if ctx.get('employee'):
+                today = timezone.now().date()
                 qs = Payroll.objects.filter(employee=ctx['employee'])
+                visible_filter = (
+                    Q(status__in=[PayrollStatus.RELEASED, PayrollStatus.PAID]) |
+                    (Q(status=PayrollStatus.FINALIZED, visibility_policy=SalarySlipVisibilityPolicy.ON_FINALIZATION)) |
+                    (
+                        Q(status=PayrollStatus.FINALIZED, visibility_policy=SalarySlipVisibilityPolicy.ON_PAYMENT_DATE) &
+                        (
+                            Q(payroll_run__expected_payment_date__lte=today) |
+                            Q(payroll_run__isnull=True)
+                        )
+                    )
+                )
+                qs = qs.filter(visible_filter)
             else:
                 qs = Payroll.objects.none()
 
@@ -102,5 +117,7 @@ class PayrollDetailView(views.APIView):
         else:
             if not ctx.get('employee') or payroll.employee_id != ctx['employee'].id:
                 raise PermissionDenied('Access forbidden.')
+            if not payroll.is_visible_to_employee:
+                raise PermissionDenied('Salary slip has not been released yet.')
 
         return Response(PayrollSerializer(payroll).data)
